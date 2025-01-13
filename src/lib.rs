@@ -3,100 +3,46 @@ mod utils;
 use wasm_bindgen::prelude::*;
 use std::fmt;
 
-#[wasm_bindgen]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cell {
-    Dead = 0,
-    Alive = 1,
-}
 
 #[wasm_bindgen]
-pub struct Universe {
-    width: u32,
-    height: u32,
-    cells: Vec<Cell>
-}
+pub fn main() {
+    let document = web_sys::window().unwrap().document().unwrap();
+    let canvas_elem = document.get_element_by_id("canvas").unwrap();
+    let canvas: &web_sys::HtmlCanvasElement = canvas_elem
+        .dyn_ref::<web_sys::HtmlCanvasElement>()
+        .expect("element with ID #canvas should be a <canvas> in index.html");
+    let context = canvas
+        .get_context("2d")
+        .expect("browser should provide a 2d context")
+        .unwrap()
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .expect("should be a CanvasRenderingContext2D object");
 
-impl Universe {
-    fn get_index(&self, row: u32, column: u32) -> usize {
-        (row * self.width + column) as usize
-    }
+    let get_u32_attr_with_default = |el: &web_sys::Element, attr: &str, default: u32| -> u32 {
+        el.get_attribute(attr).and_then(|x| x.parse::<u32>().ok()).unwrap_or(default)
+    };
+    let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
+    let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
 
-    fn live_neighbor_count(&self, row: u32, column: u32) -> u8 {
-        let mut count = 0;
-        for row_delta in [self.height - 1, 0, 1].iter() {
-            for column_delta in [self.width - 1, 0, 1].iter() {
-                if *row_delta == 0 && *column_delta == 0 {
-                    continue;
-                }
+    // Less idiomatically:
+    // let canvasWidth = canvasElem
+    //     .get_attribute("width")
+    //     .map_or(None, (|x| x.parse::<u32>().map_or(None, |y| Some(y))))
+    //     .unwrap_or(400);
 
-                let neighbor_row = (row + row_delta) % self.height;
-                let neighbor_column = (column + column_delta) % self.width;
-                let index = self.get_index(neighbor_row, neighbor_column);
-                count += self.cells[index] as u8;
-            }
-        }
-        count
-    }
-}
+        //.m
+        //.map(|x| x.parse<u32>().unwrap_or())
+        //unwrap_or("400").parse::<u32>().unwrap_or(400);
 
-#[wasm_bindgen]
-impl Universe {
-    pub fn tick(&mut self) {
-        let mut next = self.cells.clone();
+    web_sys::console::log_1(&canvas_width.to_string().into());
 
-        for row in 0..self.height {
-            for column in 0..self.width {
-                let index = self.get_index(row, column);
-                let cell = self.cells[index];
-                let live_neighbors = self.live_neighbor_count(row, column);
-                let next_cell = match (cell, live_neighbors) {
-                    (Cell::Alive, x) if x < 2 => Cell::Dead,
-                    (Cell::Alive, 2) | (Cell::Alive, 3) => Cell::Alive,
-                    (Cell::Alive, x) if x > 3 => Cell::Dead,
-                    (Cell::Dead, 3) => Cell::Alive,
-                    (otherwise, _) => otherwise
-                };
-                next[index] = next_cell;
-            }
-        }
+    context.begin_path();
+    context.move_to(0.1*canvas_width, 0.1*canvas_height);
+    context.line_to(0.9*canvas_width, 0.1*canvas_height);
+    context.line_to(0.9*canvas_width, 0.9*canvas_height);
+    context.line_to(0.1*canvas_width, 0.9*canvas_height);
+    context.close_path();
+    context.set_stroke_style_str("black");
+    context.stroke();
 
-        self.cells = next;
-    }
-
-    pub fn new() -> Universe {
-        let width = 64;
-        let height = 64;
-        let cells = (0..width * height)
-        .map(|i| {
-            if i % 2 == 0|| i % 7 == 0 {
-                Cell::Alive
-            } else {
-                Cell::Dead
-            }
-        }).collect();
-        Self {
-            width,
-            height,
-            cells
-        }
-    }
-
-    pub fn render(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl fmt::Display for Universe {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for line in self.cells.as_slice().chunks(self.width as usize) {
-            for &cell in line {
-                let symbol = if cell == Cell::Dead { '◻' } else { '◼' };
-                write!(f, "{}", symbol)?;
-            }
-            write!(f, "\n")?;
-        }
-        Ok(())
-    }
 }

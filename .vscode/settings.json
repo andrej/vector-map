@@ -1,5 +1,4 @@
 {
     "rust-analyzer.linkedProjects": [
-        "first-wasm/Cargo.toml"
     ]
 }

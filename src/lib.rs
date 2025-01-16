@@ -43,6 +43,34 @@ impl Projection<Coord3D, Coord2D> for YZPlaneProjection {
     }
 }
 
+fn dot_product(a: &Coord3D, b: &Coord3D) -> f64 {
+    a.x*b.x + a.y*b.y + a.z*b.z
+}
+
+fn normalize(a: &Coord3D) -> Coord3D {
+    let norm = f64::sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
+    Coord3D { x: a.x/norm, y: a.y/norm, z: a.z/norm }
+}
+struct OrthogonalProjection {
+    x_axis: Coord3D,
+    y_axis: Coord3D
+}
+
+impl OrthogonalProjection {
+    fn new(x_axis: Coord3D, y_axis: Coord3D) -> OrthogonalProjection {
+        OrthogonalProjection {
+            x_axis: normalize(&x_axis),
+            y_axis: normalize(&y_axis)
+        }
+    }
+}
+
+impl Projection<Coord3D, Coord2D> for OrthogonalProjection {
+    fn project(&self, input: &Coord3D) -> Coord2D {
+        Coord2D { x:  dot_product(input, &self.x_axis), y: dot_product(input, &self.y_axis) }
+    }
+}
+
 // TODO: Refactor transforms into matrices; allows for multiplying matrices
 // then applying single transform all at once
 
@@ -73,10 +101,9 @@ impl Transform<Coord2D> for Scale2D {
 }
 
 
-fn project(line: impl Iterator<Item=CoordGeo>) -> impl Iterator<Item=Coord2D> { 
-    let proj_3d = SphereProjection;
-    let proj_2d = YZPlaneProjection;
-    line.map(move |point| { 
+fn project<'a>(proj_2d: &'a impl Projection<Coord3D, Coord2D>, line: impl Iterator<Item=CoordGeo> + 'a) -> impl Iterator<Item=Coord2D> + 'a { 
+    line.map(move |point | { 
+        let proj_3d = SphereProjection;
         let Coord3D { x, y, z} = proj_3d.project(&point);
         proj_2d.project(&Coord3D { x, y, z})
     })
@@ -164,8 +191,13 @@ pub fn main() {
             })
         });
     
-    let lat_lines = lat_lines.map(project);
-    let lon_lines = lon_lines.map(project);
+    let proj_2d = OrthogonalProjection::new(
+        Coord3D { x: 0.0, y: 1.0, z: 0.0 },
+        Coord3D { x: 0.0, y: 0.0, z: 1.0 }
+    );
+
+    let lat_lines = lat_lines.map(|x| { project(&proj_2d, x) });
+    let lon_lines = lon_lines.map(|x| { project(&proj_2d, x) });
 
     let scale_fac = f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
     let scale = Scale2D { x: scale_fac, y: scale_fac };

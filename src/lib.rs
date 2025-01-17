@@ -2,6 +2,7 @@ mod utils;
 
 use wasm_bindgen::prelude::*;
 use std::fmt;
+use std::ops;
 
 struct CoordGeo {
     latitude: f64,
@@ -12,6 +13,36 @@ struct Coord3D {
     x: f64,
     y: f64,
     z: f64
+}
+
+impl ops::Sub<&Coord3D> for &Coord3D {
+    type Output = Coord3D;
+
+    fn sub(self, rhs: &Coord3D) -> Coord3D {
+        Coord3D {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+            z: self.z - rhs.z
+        }
+    }
+}
+
+impl ops::Mul<f64> for &Coord3D {
+    type Output = Coord3D;
+
+    fn mul(self, rhs: f64) -> Coord3D {
+        Coord3D {
+            x: self.x * rhs,
+            y: self.y * rhs,
+            z: self.z * rhs
+        }
+    }
+}
+
+impl fmt::Display for Coord3D {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ x: {}, y: {}, z: {} }}", self.x, self.y, self.z)
+    }
 }
 
 struct Coord2D {
@@ -51,6 +82,19 @@ fn normalize(a: &Coord3D) -> Coord3D {
     let norm = f64::sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
     Coord3D { x: a.x/norm, y: a.y/norm, z: a.z/norm }
 }
+
+fn cross_product(a: &Coord3D, b: &Coord3D) -> Coord3D {
+    Coord3D {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x
+    }
+}
+
+fn project_onto_plane(plane_normal: &Coord3D, vector: &Coord3D) -> Coord3D {
+    let plane_normal = normalize(plane_normal);
+    vector - &(&plane_normal * dot_product(vector, &plane_normal))
+}
 struct OrthogonalProjection {
     x_axis: Coord3D,
     y_axis: Coord3D
@@ -61,6 +105,26 @@ impl OrthogonalProjection {
         OrthogonalProjection {
             x_axis: normalize(&x_axis),
             y_axis: normalize(&y_axis)
+        }
+    }
+
+    fn new_from_normal(normal: Coord3D) -> OrthogonalProjection {
+        // Choose some arbitrary vector that is not parallel to normal
+        let v = Coord3D {
+            x: if normal.x != 0.0 { 0.0 } else { 1.0 },
+            ..normal
+        };
+        web_sys::console::log_2(&"Normal: ".into(), &normal.to_string().into());
+        // Project it onto the plane normal to `normal`
+        let x_axis = normalize(&project_onto_plane(&normal, &v));
+        // Find a vector orthogonal to both x_axis and `normal`.
+        // By making it orthogonal to `normal` it is guaranteed to lie in the plane.
+        let y_axis = normalize(&cross_product(&normal, &x_axis));
+        web_sys::console::log_2(&"X Axis: ".into(), &x_axis.to_string().into());
+        web_sys::console::log_2(&"Y Axis: ".into(), &y_axis.to_string().into());
+        OrthogonalProjection {
+            x_axis: x_axis,
+            y_axis: y_axis
         }
     }
 }
@@ -191,9 +255,12 @@ pub fn main() {
             })
         });
     
-    let proj_2d = OrthogonalProjection::new(
-        Coord3D { x: 0.0, y: 1.0, z: 0.0 },
-        Coord3D { x: 0.0, y: 0.0, z: 1.0 }
+    //let proj_2d = OrthogonalProjection::new(
+    //    Coord3D { x: 0.0, y: 1.0, z: 0.0 },
+    //    Coord3D { x: 0.0, y: 0.0, z: 1.0 }
+    //);
+    let proj_2d = OrthogonalProjection::new_from_normal(
+        Coord3D { x: 0.0, y: 0.5, z: 0.5 },
     );
 
     let lat_lines = lat_lines.map(|x| { project(&proj_2d, x) });

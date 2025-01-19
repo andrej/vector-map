@@ -4,6 +4,10 @@ use wasm_bindgen::prelude::*;
 use std::fmt;
 use std::ops;
 
+use std::rc::Rc;
+use std::cell::RefCell;
+use futures::lock::Mutex;
+
 struct CoordGeo {
     latitude: f64,
     longitude: f64
@@ -193,6 +197,130 @@ fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterat
     context.stroke();
 }
 
+struct World {
+    window: web_sys::Window,
+    //context: web_sys::CanvasRenderingContext2d,
+    render_closure: Option<Closure<dyn Fn()>>,
+    some_n: u32
+}
+
+impl World {
+    // Using a RefCell and Rc is almost unavoidable here:
+    // The request_animation_frame callback needs to borrow World so it can see
+    // what it should render. It needs access to World.
+    // However, that callback may get called at any time in the future by the
+    // browser; hence the requirement of web_sys for the callback to have a 
+    // 'static lifetime.
+
+    // At the same time, if we want to be able to modify the world to render
+    // at all, we are going to need to take mutable references to it at some
+    // point. Thus, to enable this, we must use dynamic borrow checking 
+    // implemented in RefCell. Rc allows us to hold multiple references to this
+    // RefCell using reference counting.
+
+    // An alternative approach would be to create a new closure for each
+    // rendering frame, then call any functionality needed to update the state
+    // of the world from within the rendering frame closure. The last thing the 
+    // closure would do is move `self` into a new, next closure for the next 
+    // rendering frame. This would preserve borrow semantics, since no borrows
+    // would overlap (the state updating function would require a mutable ref
+    // to self, but it would return and then let the rendering function inspect
+    // the state of the world after it is done).
+    fn wrap(self) -> Rc<Mutex<Self>> {
+        let this = Rc::new(Mutex::new(self));
+        this
+    }
+
+    fn init(this: &Rc<Mutex<Self>>) -> () {
+        let clos_this = Rc::clone(&this);
+        let clos: Closure<dyn Fn()> = Closure::new(move || { 
+            let fut_this = Rc::clone(&clos_this);
+            wasm_bindgen_futures::spawn_local(async move {
+                let t = fut_this.lock().await;
+                t.frame().await;
+            });
+        });
+        //(*this).as_ref().borrow_mut().render_closure = Some(clos);
+
+        let another_this = Rc::clone(&this);
+        wasm_bindgen_futures::spawn_local(async move {
+            web_sys::console::log_1(&"putting in closure".into());
+            sleep(100).await;
+            another_this.lock().await.render_closure = Some(clos);
+        });
+    }
+
+    fn run(this: &Rc<Mutex<Self>>) -> () {
+        // Kick off rendering loop; this is the first request_animation frame,
+        // then subsequent calls to the same function are made form within 
+        // frame() to keep it going. 
+        // Since frame is async we can preempt it with state updates
+        let this1 = Rc::clone(&this);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                web_sys::console::log_1(&"wait for closure to be ready".into());
+                if this1.lock().await.render_closure.is_some() {
+                    break;
+                }
+                sleep(10).await;
+            }
+            this1.lock().await.req_animation_frame();
+        });
+        let this2 = Rc::clone(&this);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                if this2.lock().await.some_n > 10 {
+                    break;
+                }
+                World::update_state(&this2).await;
+            }
+        });
+    }
+
+    async fn update_state(this: &Rc<Mutex<Self>>) -> () {
+        {
+            let t = &mut *this.lock().await;
+            web_sys::console::log_2(&"update state".into(), &t.some_n.into());
+            t.some_n += 1;
+        }
+        // It is critical this sleep is outside of the above block; otherwise
+        // the lock on `this` is apparently held for the entire time we are
+        // sleeping
+        sleep(1000).await;
+    }
+
+    fn req_animation_frame(&self) {
+        let clos = self.render_closure.as_ref().unwrap();
+        self.window.request_animation_frame(clos.as_ref().unchecked_ref()).expect("Unable to set requestAnimationFrame");
+    }
+
+    async fn frame(&self) {
+        web_sys::console::log_2(&"render frame".into(), &self.some_n.into());
+        if self.some_n < 10 {
+            self.req_animation_frame();
+        }
+    }
+}
+
+// credit: anon80458984
+// https://users.rust-lang.org/t/async-sleep-in-rust-wasm32/78218/5
+pub async fn sleep(delay: i32) {
+    let mut cb = 
+        | resolve: wasm_bindgen_futures::js_sys::Function,
+          reject: wasm_bindgen_futures::js_sys::Function | 
+        {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, delay)
+                .expect("unable to use JS setTimeout");
+        };
+
+    let p = wasm_bindgen_futures::js_sys::Promise::new(&mut cb);
+
+    wasm_bindgen_futures::JsFuture::from(p).await.unwrap();
+}
+
+
 #[wasm_bindgen]
 pub fn main() {
     let document = web_sys::window().unwrap().document().unwrap();
@@ -212,6 +340,15 @@ pub fn main() {
     };
     let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
     let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
+
+    let wrld = World { 
+        window: web_sys::window().unwrap(),
+        render_closure: None,
+        some_n: 0
+    };
+    let moved_world = wrld.wrap();
+    World::init(&moved_world);
+    World::run(&moved_world);
 
     // Less idiomatically:
     // let canvasWidth = canvasElem
@@ -260,7 +397,7 @@ pub fn main() {
     //    Coord3D { x: 0.0, y: 0.0, z: 1.0 }
     //);
     let proj_2d = OrthogonalProjection::new_from_normal(
-        Coord3D { x: 0.0, y: 0.5, z: 0.5 },
+        Coord3D { x: 0.0, y: 0.3, z: 0.2 },
     );
 
     let lat_lines = lat_lines.map(|x| { project(&proj_2d, x) });

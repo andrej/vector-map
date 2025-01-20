@@ -151,14 +151,11 @@ impl OrthogonalProjection {
                 z: 1.0
             }
         };
-        web_sys::console::log_2(&"Normal: ".into(), &normal.to_string().into());
         // Project it onto the plane normal to `normal`
         let y_axis = normalize(&project_onto_plane(&normal, &v));
         // Find a vector orthogonal to both x_axis and `normal`.
         // By making it orthogonal to `normal` it is guaranteed to lie in the plane.
         let x_axis = normalize(&cross_product(&normal, &y_axis));
-        web_sys::console::log_2(&"X Axis: ".into(), &x_axis.to_string().into());
-        web_sys::console::log_2(&"Y Axis: ".into(), &y_axis.to_string().into());
         OrthogonalProjection {
             x_axis: x_axis,
             y_axis: y_axis
@@ -244,9 +241,11 @@ fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterat
 
 struct World {
     window: web_sys::Window,
-    //context: web_sys::CanvasRenderingContext2d,
+    context: web_sys::CanvasRenderingContext2d,
+    width: f64,
+    height: f64,
     render_closure: Option<Closure<dyn Fn()>>,
-    some_n: u32
+    cur_yaw: f64
 }
 
 impl World {
@@ -289,8 +288,6 @@ impl World {
 
         let another_this = Rc::clone(&this);
         wasm_bindgen_futures::spawn_local(async move {
-            web_sys::console::log_1(&"putting in closure".into());
-            sleep(100).await;
             another_this.lock().await.render_closure = Some(clos);
         });
     }
@@ -303,7 +300,6 @@ impl World {
         let this1 = Rc::clone(&this);
         wasm_bindgen_futures::spawn_local(async move {
             loop {
-                web_sys::console::log_1(&"wait for closure to be ready".into());
                 if this1.lock().await.render_closure.is_some() {
                     break;
                 }
@@ -314,24 +310,23 @@ impl World {
         let this2 = Rc::clone(&this);
         wasm_bindgen_futures::spawn_local(async move {
             loop {
-                if this2.lock().await.some_n > 10 {
-                    break;
-                }
                 World::update_state(&this2).await;
             }
         });
     }
 
     async fn update_state(this: &Rc<Mutex<Self>>) -> () {
+        let mut cur_yaw: f64;
         {
             let t = &mut *this.lock().await;
-            web_sys::console::log_2(&"update state".into(), &t.some_n.into());
-            t.some_n += 1;
+            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 0.5) % 360.0);
+            cur_yaw = t.cur_yaw;
         }
         // It is critical this sleep is outside of the above block; otherwise
         // the lock on `this` is apparently held for the entire time we are
         // sleeping
-        sleep(1000).await;
+        //web_sys::console::log_1(&cur_yaw.to_string().into());
+        sleep(20).await;
     }
 
     fn req_animation_frame(&self) {
@@ -340,10 +335,29 @@ impl World {
     }
 
     async fn frame(&self) {
-        web_sys::console::log_2(&"render frame".into(), &self.some_n.into());
-        if self.some_n < 10 {
-            self.req_animation_frame();
-        }
+
+        let proj_3d = SphereProjection;
+        let proj_2d = proj_from_angles(self.cur_yaw, f64::to_radians(15.0));
+
+        let n_lines = 18;
+        let resolution = 36; 
+        let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
+
+        let lat_lines = lat_lines.into_iter().map(|x| { project_generic(&proj_2d, project_generic(&proj_3d, x.into_iter())) });
+        let lon_lines = lon_lines.into_iter().map(|x| { project(&proj_2d, project(&proj_3d, x.into_iter())) });
+
+        let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
+        let scale = Scale2D { x: scale_fac, y: scale_fac };
+        let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
+
+        let lat_lines = lat_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
+        let lon_lines = lon_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
+
+        self.context.clear_rect(0.0, 0.0, self.width, self.height);
+        lat_lines.for_each(|mut l| { draw_line(&self.context, &mut l) } );
+        lon_lines.for_each(|mut l| { draw_line(&self.context, &mut l) } );
+
+        self.req_animation_frame();
     }
 }
 
@@ -439,7 +453,10 @@ pub fn main() {
     let wrld = World { 
         window: web_sys::window().unwrap(),
         render_closure: None,
-        some_n: 0
+        context: context,
+        width: canvas_width,
+        height: canvas_height,
+        cur_yaw: 0.0
     };
     let moved_world = wrld.wrap();
     World::init(&moved_world);
@@ -457,34 +474,13 @@ pub fn main() {
 
     web_sys::console::log_2(&canvas_width.to_string().into(), &canvas_height.to_string().into());
 
-    context.begin_path();
-    context.move_to(0.05*canvas_width, 0.05*canvas_height);
-    context.line_to(0.95*canvas_width, 0.05*canvas_height);
-    context.line_to(0.95*canvas_width, 0.95*canvas_height);
-    context.line_to(0.05*canvas_width, 0.95*canvas_height);
-    context.close_path();
-    context.set_stroke_style_str("black");
-    context.stroke();
-
-    // Generate some latitude and longitude points
-    let n_lines = 18;
-    let resolution = 36; 
-    let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
-    
-    let proj_3d = SphereProjection;
-    let proj_2d = proj_from_angles(f64::to_radians(45.0), f64::to_radians(1.0));
-
-    let lat_lines = lat_lines.map(|x| { project_generic(&proj_2d, project_generic(&proj_3d, x)) });
-    let lon_lines = lon_lines.map(|x| { project(&proj_2d, project(&proj_3d, x)) });
-
-    let scale_fac = f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
-    let scale = Scale2D { x: scale_fac, y: scale_fac };
-    let translate = Translate2D { x: canvas_width/2.0, y: canvas_height/2.0 };
-
-    let lat_lines = lat_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
-    let lon_lines = lon_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
-
-    lat_lines.for_each(|mut l| { draw_line(&context, &mut l) } );
-    lon_lines.for_each(|mut l| { draw_line(&context, &mut l) } );
+    //context.begin_path();
+    //context.move_to(0.05*canvas_width, 0.05*canvas_height);
+    //context.line_to(0.95*canvas_width, 0.05*canvas_height);
+    //context.line_to(0.95*canvas_width, 0.95*canvas_height);
+    //context.line_to(0.05*canvas_width, 0.95*canvas_height);
+    //context.close_path();
+    //context.set_stroke_style_str("black");
+    //context.stroke();
 
 }

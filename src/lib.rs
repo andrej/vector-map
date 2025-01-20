@@ -54,6 +54,12 @@ struct Coord2D {
     y: f64
 }
 
+impl fmt::Display for Coord2D {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ x: {}, y: {}}}", self.x, self.y)
+    }
+}
+
 trait Projection<From, To> {
     fn project(&self, input: &From) -> To;
 }
@@ -67,14 +73,6 @@ impl Projection<CoordGeo, Coord3D> for SphereProjection {
         Coord3D { x: r * f64::cos(lat) * f64::cos(lon),
                   y: r * f64::cos(lat) * f64::sin(lon),
                   z: r * f64::sin(lat) }
-    }
-}
-
-struct YZPlaneProjection;
-
-impl Projection<Coord3D, Coord2D> for YZPlaneProjection {
-    fn project(&self, input: &Coord3D) -> Coord2D {
-        Coord2D { x: input.y, y: input.z }
     }
 }
 
@@ -169,6 +167,15 @@ impl Projection<Coord3D, Coord2D> for OrthogonalProjection {
     }
 }
 
+impl OrthogonalProjection {
+    fn cull(&self, input: &Coord3D, distance: f64) -> bool {
+        let normal = cross_product(&self.x_axis, &self.y_axis); 
+            // TODO: optimize this so we don't recaculate normal for every. single. coordinate.
+        //web_sys::console::log_1(&dot_product(input, &normal).to_string().into());
+        dot_product(input, &normal) < distance 
+    }
+}
+
 // TODO: Refactor transforms into matrices; allows for multiplying matrices
 // then applying single transform all at once
 
@@ -176,6 +183,7 @@ trait Transform<CoordType> {
     fn transform(&self, input: &CoordType) -> CoordType;
 }
 
+#[derive(Copy, Clone)]
 struct Translate2D {
     x: f64,
     y: f64   
@@ -187,6 +195,7 @@ impl Transform<Coord2D> for Translate2D {
     }
 }
 
+#[derive(Copy, Clone)]
 struct Scale2D {
     x: f64,
     y: f64
@@ -228,15 +237,26 @@ where
     line.map(move |point| { proj.project(&point) })
 }
 
-fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterator<Item=Coord2D>) {
+enum DrawOp {
+    MoveTo(Coord2D),
+    LineTo(Coord2D)
+}
+
+fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterator<Item=DrawOp>) {
     context.begin_path();
-    let first_point = line.nth(0).expect("every line should have at least one point");
-    let Coord2D {x, y} = first_point;
-    context.move_to(x, y);
-    for Coord2D {x, y} in line {
-        context.line_to(x, y);
+    let mut i = 0;
+    for op in line {
+        match op {
+            DrawOp::MoveTo(Coord2D { x, y }) => context.move_to(x, y),
+            DrawOp::LineTo(Coord2D { x, y }) => context.line_to(x, y)
+        }
     }
     context.stroke();
+}
+
+enum BounceDirection {
+    BounceUp(f64),
+    BounceDown(f64)
 }
 
 struct World {
@@ -245,7 +265,9 @@ struct World {
     width: f64,
     height: f64,
     render_closure: Option<Closure<dyn Fn()>>,
-    cur_yaw: f64
+    cur_yaw: f64,
+    cur_pitch: f64,
+    cur_bounce_direction: BounceDirection
 }
 
 impl World {
@@ -319,7 +341,22 @@ impl World {
         let mut cur_yaw: f64;
         {
             let t = &mut *this.lock().await;
-            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 0.5) % 360.0);
+            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 1.0) % 360.0);
+            match t.cur_bounce_direction {
+                BounceDirection::BounceUp(x) => {
+                    t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
+                    if t.cur_pitch > f64::to_radians(30.0) {
+                        t.cur_bounce_direction = BounceDirection::BounceDown(-0.2);
+                    }
+                }
+                BounceDirection::BounceDown(x) => {
+                    t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
+                    if t.cur_pitch < f64::to_radians(-30.0) {
+                        t.cur_bounce_direction = BounceDirection::BounceUp(0.3);
+                    }
+                }
+            }
+            //t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + 1.0) % 10.0);
             cur_yaw = t.cur_yaw;
         }
         // It is critical this sleep is outside of the above block; otherwise
@@ -334,28 +371,67 @@ impl World {
         self.window.request_animation_frame(clos.as_ref().unchecked_ref()).expect("Unable to set requestAnimationFrame");
     }
 
-    async fn frame(&self) {
-
-        let proj_3d = SphereProjection;
-        let proj_2d = proj_from_angles(self.cur_yaw, f64::to_radians(15.0));
-
-        let n_lines = 18;
-        let resolution = 36; 
-        let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
-
-        let lat_lines = lat_lines.into_iter().map(|x| { project_generic(&proj_2d, project_generic(&proj_3d, x.into_iter())) });
-        let lon_lines = lon_lines.into_iter().map(|x| { project(&proj_2d, project(&proj_3d, x.into_iter())) });
+    fn map_and_filter_lines<'a>(
+        &self, 
+        proj_3d: &'a (impl Projection<CoordGeo, Coord3D>), 
+        proj_2d: &'a OrthogonalProjection, 
+        inp_lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a)
+    -> impl Iterator<Item=impl Iterator<Item=DrawOp> + 'a> + 'a {
 
         let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
         let scale = Scale2D { x: scale_fac, y: scale_fac };
         let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
 
-        let lat_lines = lat_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
-        let lon_lines = lon_lines.map(|x| { x.map(|x| { translate.transform(&scale.transform(&x)) })});
+        let lines = 
+            inp_lines.into_iter()
+            .map(move |x| { project(proj_3d, x.into_iter()) })
+            .map(move |line| { 
+                let mut culled_last = true;
+                let mut draw_ops = Vec::<DrawOp>::new();
+                for p_3d in line {
+                    let cull_this = proj_2d.cull(&p_3d, 0.0);
+                    let p_2d = translate.transform(&scale.transform(&proj_2d.project(&p_3d)));
+                    if !cull_this {
+                        draw_ops.push(if culled_last {
+                            DrawOp::MoveTo(p_2d)
+                        } else {
+                            DrawOp::LineTo(p_2d)
+                        });
+                    }
+                    culled_last = cull_this
+                }
+                draw_ops.into_iter()
+            });
+
+        lines
+    }
+
+    async fn frame(&self) {
+
+        let proj_3d = SphereProjection;
+        let proj_2d = proj_from_angles(self.cur_yaw, self.cur_pitch);
 
         self.context.clear_rect(0.0, 0.0, self.width, self.height);
-        lat_lines.for_each(|mut l| { draw_line(&self.context, &mut l) } );
-        lon_lines.for_each(|mut l| { draw_line(&self.context, &mut l) } );
+
+        let n_lines = 18;
+        let resolution = 36; 
+        let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
+
+        let lat_lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lat_lines);
+        let lon_lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lon_lines);
+
+        //let lat_lines: Vec<Vec<Coord2D>> = lat_lines.map(|x|{x.collect()}).collect();
+        //web_sys::console::log_1(&lat_lines.iter().map(|x| { x.into_iter().map(|x|{x.to_string()}).fold(String::new(), |a,e| { format!("{}, {}", a, e) }) }).fold(String::new(), |a, e|{format!("{}\n{}", a, e)}).into());
+        lat_lines.for_each(|mut l| { 
+            self.context.set_line_width(1.0);
+            self.context.set_stroke_style_str("rgba(0,0,0,0.5)");
+            draw_line(&self.context, &mut l) 
+        } );
+        lon_lines.enumerate().for_each(|(i, mut l)| { 
+            self.context.set_line_width(2.0);
+            self.context.set_stroke_style_str(format!("hsl({}deg 100% 50%", ((i as f64)/(n_lines as f64)*360.0).to_string()).as_str());
+            draw_line(&self.context, &mut l) 
+        } );
 
         self.req_animation_frame();
     }
@@ -456,7 +532,9 @@ pub fn main() {
         context: context,
         width: canvas_width,
         height: canvas_height,
-        cur_yaw: 0.0
+        cur_yaw: 0.0,
+        cur_pitch: f64::to_radians(0.0),
+        cur_bounce_direction: BounceDirection::BounceUp(0.5)
     };
     let moved_world = wrld.wrap();
     World::init(&moved_world);

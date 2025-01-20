@@ -82,8 +82,12 @@ fn dot_product(a: &Coord3D, b: &Coord3D) -> f64 {
     a.x*b.x + a.y*b.y + a.z*b.z
 }
 
+fn norm(a: &Coord3D) -> f64 {
+    f64::sqrt(a.x*a.x + a.y*a.y + a.z*a.z)
+}
+
 fn normalize(a: &Coord3D) -> Coord3D {
-    let norm = f64::sqrt(a.x*a.x + a.y*a.y + a.z*a.z);
+    let norm = norm(a);
     Coord3D { x: a.x/norm, y: a.y/norm, z: a.z/norm }
 }
 
@@ -96,6 +100,11 @@ fn cross_product(a: &Coord3D, b: &Coord3D) -> Coord3D {
 }
 
 fn project_onto_plane(plane_normal: &Coord3D, vector: &Coord3D) -> Coord3D {
+    // Intuition: dot product `vector`*`plane_normal` gives the component of 
+    // `vector` in the `plane_normal` direction (i.e. if they are parallel,
+    // this gives all of `vector`).
+    // By subtracting everything in this direction, which is the normal of the
+    // plane, we subtract the direction that would take a point "off" the plane.
     let plane_normal = normalize(plane_normal);
     vector - &(&plane_normal * dot_product(vector, &plane_normal))
 }
@@ -113,17 +122,41 @@ impl OrthogonalProjection {
     }
 
     fn new_from_normal(normal: Coord3D) -> OrthogonalProjection {
-        // Choose some arbitrary vector that is not parallel to normal
-        let v = Coord3D {
-            x: if normal.x != 0.0 { 0.0 } else { 1.0 },
-            ..normal
+        // Choose a vector that is not parallel to normal. We will project it
+        // onto the plane next.
+        // Our goal is to make sure the projection plane is "level" w.r.t. the
+        // XY plane. That is, one axis of the projection plane should be
+        // parallel to the XY plane, and the other perpendicular to that. This
+        // way, the projection plane is not askew w.r.t. the XY plane.
+        // This works in all but one case: If we are looking straight down at
+        // the scene (i.e. normal vector is equal to the Z basis vector), the
+        // projection of the Z basis vector onto the plane will be the zero
+        // vector. This also makes sense in that it is unclear what "askew"
+        // w.r.t. to the XZ plane would mean if our projection plane is exactly
+        // the XZ plane. Another way of thinking of it: If we look straight down
+        // at the globe form the North pole, there is no right or wrong
+        // rotation.
+        // We arbitrarily choose the Y basis vector in that special case.
+        let v = if normal.z != 0.0 && normal.x == 0.0 && normal.y == 0.0 {
+            // Special case: Looking straight down at XZ plane.
+            Coord3D {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0
+            }
+        } else {
+            Coord3D {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0
+            }
         };
         web_sys::console::log_2(&"Normal: ".into(), &normal.to_string().into());
         // Project it onto the plane normal to `normal`
-        let x_axis = normalize(&project_onto_plane(&normal, &v));
+        let y_axis = normalize(&project_onto_plane(&normal, &v));
         // Find a vector orthogonal to both x_axis and `normal`.
         // By making it orthogonal to `normal` it is guaranteed to lie in the plane.
-        let y_axis = normalize(&cross_product(&normal, &x_axis));
+        let x_axis = normalize(&cross_product(&normal, &y_axis));
         web_sys::console::log_2(&"X Axis: ".into(), &x_axis.to_string().into());
         web_sys::console::log_2(&"Y Axis: ".into(), &y_axis.to_string().into());
         OrthogonalProjection {
@@ -169,21 +202,33 @@ impl Transform<Coord2D> for Scale2D {
 }
 
 
-fn project<'a>(proj_2d: &'a impl Projection<Coord3D, Coord2D>, line: impl Iterator<Item=CoordGeo> + 'a) -> impl Iterator<Item=Coord2D> + 'a { 
+fn project<'a, A, B>(proj: &'a impl Projection<A, B>, line: impl Iterator<Item=A> + 'a) -> impl Iterator<Item=B> + 'a { 
     line.map(move |point | { 
-        let proj_3d = SphereProjection;
-        let Coord3D { x, y, z} = proj_3d.project(&point);
-        proj_2d.project(&Coord3D { x, y, z})
+        proj.project(&point)
     })
 }
 
-fn project_generic<I1, I2>(line: I1) -> impl Iterator<Item=Coord2D>
+// The reason using a generic (e.g. I_out where I_out: Iterator<Item=Coord2d>)
+// for the return type does not work here is that the type that the function
+// returns cannot be named, because it contains closures. Closures have a type
+// that cannot be named. When using generics, the caller would have to specify
+// the concrete return type at the call site; something that is not possible
+// with types containing closuers. Using `impl` allows the compiler to infer 
+// that type. `impl` does not mean dynamic dispatch; the compiler will still
+// monomorphize the code at each call site, that is, specialzie the function
+// for each type that it returns, just like it would for a generic.
+// The reason generics work for the *input* parameters is that the caller is
+// responsible for naming all types: The caller knows the (opaque) types for
+// the iterators it passes in, becaues it has created the closures. However,
+// this function then creates a closure for the returned iterator as well; the
+// caller cannot know or name the type of this closure, since it is created
+// in this function, not the caller.
+fn project_generic<'a, A, B, I, P>(proj: &'a P, line: I) -> impl Iterator<Item=B> + 'a
 where 
-    I1: Iterator<Item=CoordGeo>,
+    I: Iterator<Item=A> + 'a,
+    P: Projection<A, B> + 'a
 { 
-    let proj_3d = SphereProjection;
-    let proj_2d = YZPlaneProjection;
-    line.map(move |point| { proj_2d.project(&proj_3d.project(&point)) })
+    line.map(move |point| { proj.project(&point) })
 }
 
 fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterator<Item=Coord2D>) {
@@ -320,6 +365,56 @@ pub async fn sleep(delay: i32) {
     wasm_bindgen_futures::JsFuture::from(p).await.unwrap();
 }
 
+fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl Iterator<Item=CoordGeo>>, impl Iterator<Item=impl Iterator<Item=CoordGeo>>) {
+    let lat_lines = 
+        (0..n_lines).map(move |lat_i| { 
+            let lat: f64 = -90.0 + (lat_i as f64) / (n_lines as f64) * 180.0;
+            (0..resolution).map(move |lon_i| { 
+                let lon: f64 = -180.0 + (lon_i as f64) / (resolution as f64) * 360.0;
+                //let lon: f64 = -90.0 + (lon_i as f64) / (resolution as f64) * 180.0;
+                CoordGeo { latitude: lat, longitude: lon } 
+            })
+        });
+    // I'm assuming `move` in the closure here probably works because n_lines
+    // implements Copy
+    let lon_lines =
+        (0..n_lines).map(move |lon_i| { 
+            let lon: f64 = -90.0 + (lon_i as f64) / (n_lines as f64) * 180.0;
+            (0..resolution).map(move |lat_i| { 
+                let lat: f64 = -180.0 + (lat_i as f64) / (resolution as f64) * 360.0;
+                CoordGeo { latitude: lat, longitude: lon } 
+            })
+        });
+    (lat_lines, lon_lines)
+}
+
+fn proj_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
+    // First, draw a unit length vector going into space from the origin, at
+    // an angle of `pitch` measured from the XY plane. To get the Z component,
+    // consider the vector the hypothenuse of a triangle, with the Z axis being
+    // the adjacent side of a 90-pitch angle. cos=adj./hyp., so cos(180-pitch)
+    // is the Z height. Since cos(90-pitch) = sin(pitch) we use that.
+    // Now, to figure out the X and Y components, forget about the first 
+    // triangle. Instead, draw a triangle where the hypothenuse lies on the 
+    // XY plane, the unit vector is the adjacent side, and the opposite side
+    // is prependicular to the unit vector, i.e. a right angle floating in
+    // space, pointing down at the XY plane.
+    // The length of the hyptohenuse will not be one (unless pitch is zero).
+    // Draw two more triangles using the hypthenuse of the previous triangle as
+    // its hypothenuse, and the adjacent sides being the X and Y axes, 
+    // respectively, for each triangle.
+    // The yaw angle is the angle between Y axis and the hypothenuse, so
+    // the Y component is cos*hyp = ajd/hyp*hyp = adj. and the X component is
+    // sin*hyp = opp/hyp*hyp = opp.
+    // To get the value of hyp, use cos(yaw).
+    let normal = Coord3D {
+        x: f64::sin(yaw)*f64::cos(pitch),
+        y: f64::cos(yaw)*f64::cos(pitch),
+        z: f64::sin(pitch)
+    };
+    OrthogonalProjection::new_from_normal(normal)
+}
+
 
 #[wasm_bindgen]
 pub fn main() {
@@ -374,34 +469,13 @@ pub fn main() {
     // Generate some latitude and longitude points
     let n_lines = 18;
     let resolution = 36; 
-    let lat_lines = 
-        (0..n_lines).map(|lat_i| { 
-            let lat: f64 = -90.0 + (lat_i as f64) / (n_lines as f64) * 180.0;
-            (0..resolution).map(move |lon_i| { 
-                let lon: f64 = -180.0 + (lon_i as f64) / (resolution as f64) * 360.0;
-                //let lon: f64 = -90.0 + (lon_i as f64) / (resolution as f64) * 180.0;
-                CoordGeo { latitude: lat, longitude: lon } 
-            })
-        });
-    let lon_lines =
-        (0..n_lines).map(|lon_i| { 
-            let lon: f64 = -90.0 + (lon_i as f64) / (n_lines as f64) * 180.0;
-            (0..resolution).map(move |lat_i| { 
-                let lat: f64 = -180.0 + (lat_i as f64) / (resolution as f64) * 360.0;
-                CoordGeo { latitude: lat, longitude: lon } 
-            })
-        });
+    let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
     
-    //let proj_2d = OrthogonalProjection::new(
-    //    Coord3D { x: 0.0, y: 1.0, z: 0.0 },
-    //    Coord3D { x: 0.0, y: 0.0, z: 1.0 }
-    //);
-    let proj_2d = OrthogonalProjection::new_from_normal(
-        Coord3D { x: 0.0, y: 0.3, z: 0.2 },
-    );
+    let proj_3d = SphereProjection;
+    let proj_2d = proj_from_angles(f64::to_radians(45.0), f64::to_radians(1.0));
 
-    let lat_lines = lat_lines.map(|x| { project(&proj_2d, x) });
-    let lon_lines = lon_lines.map(|x| { project(&proj_2d, x) });
+    let lat_lines = lat_lines.map(|x| { project_generic(&proj_2d, project_generic(&proj_3d, x)) });
+    let lon_lines = lon_lines.map(|x| { project(&proj_2d, project(&proj_3d, x)) });
 
     let scale_fac = f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
     let scale = Scale2D { x: scale_fac, y: scale_fac };

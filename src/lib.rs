@@ -2,17 +2,45 @@ mod utils;
 
 use wasm_bindgen::prelude::*;
 use std::fmt;
+use std::iter::Zip;
 use std::ops;
 
 use std::rc::Rc;
 use std::cell::RefCell;
 use futures::lock::Mutex;
 
+const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/geoBoundariesCGAZ_ADM0.shp");
+
+//struct Shapefile;
+//
+//impl Shapefile {
+//    fn from_bytes(bytes: &[u8]) -> Self {
+//        //web_sys::console::log_3(&bytes[0].to_string().into(), &bytes[1].to_string().into(), &bytes[3].to_string().into());
+//        web_sys::console::log_1(&format!("{0:x} {1:x} {2:x} {3:x}", bytes[0], bytes[1], bytes[2], bytes[3]).into());
+//        //web_sys::console::log_3(&bytes[0].to_string().into(), &bytes[1].to_string().into(), &bytes[3].to_string().into());
+//        assert!(bytes[0] == 0x00);
+//        assert!(bytes[1] == 0x00);
+//        assert!(bytes[2] == 0x27);
+//        assert!(bytes[3] == 0x0a);
+//        Shapefile {}
+//    }
+//}
+//
+
+
+#[derive(Copy, Clone)]
 struct CoordGeo {
     latitude: f64,
     longitude: f64
 }
 
+impl fmt::Display for CoordGeo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ latitude: {}, longitude: {} }}", self.latitude, self.longitude)
+    }
+}
+
+#[derive(Copy, Clone)]
 struct Coord3D {
     x: f64,
     y: f64,
@@ -49,6 +77,7 @@ impl fmt::Display for Coord3D {
     }
 }
 
+#[derive(Copy, Clone)]
 struct Coord2D {
     x: f64,
     y: f64
@@ -70,9 +99,9 @@ impl Projection<CoordGeo, Coord3D> for SphereProjection {
     fn project(&self, input: &CoordGeo) -> Coord3D {
         let r = 1.0;
         let [lat, lon] = [input.latitude, input.longitude].map(f64::to_radians);
-        Coord3D { x: r * f64::cos(lat) * f64::cos(lon),
-                  y: r * f64::cos(lat) * f64::sin(lon),
-                  z: r * f64::sin(lat) }
+        Coord3D { x: r * f64::cos(-lat) * f64::cos(lon),
+                  y: r * f64::cos(-lat) * f64::sin(lon),
+                  z: r * f64::sin(-lat) }
     }
 }
 
@@ -252,6 +281,7 @@ fn draw_line(context: &web_sys::CanvasRenderingContext2d, line: &mut impl Iterat
         }
     }
     context.stroke();
+    context.fill();
 }
 
 enum BounceDirection {
@@ -259,7 +289,21 @@ enum BounceDirection {
     BounceDown(f64)
 }
 
-struct World {
+fn duplicate_iter<'a, IterType, ElemType>(iter: IterType) -> (IterType, IterType)
+where
+    IterType: Iterator<Item=ElemType> + Default + Extend<ElemType>,
+    ElemType: Clone
+{
+    iter.map(|x| { (x.clone(), x) }).unzip()
+}
+
+
+struct World<F, T1, T2>
+where 
+    F: FnMut() -> T1,
+    T1: Iterator<Item=T2>,
+    T2: Iterator<Item=CoordGeo>
+{
     window: web_sys::Window,
     context: web_sys::CanvasRenderingContext2d,
     width: f64,
@@ -267,10 +311,16 @@ struct World {
     render_closure: Option<Closure<dyn Fn()>>,
     cur_yaw: f64,
     cur_pitch: f64,
-    cur_bounce_direction: BounceDirection
+    cur_bounce_direction: BounceDirection,
+    get_lines_it: F,
 }
 
-impl World {
+impl<'a, F, T1, T2> World<F, T1, T2>
+where 
+    F: (FnMut() -> T1) + 'static,
+    T1: Iterator<Item=T2> + 'static,
+    T2: Iterator<Item=CoordGeo> + 'static
+{
     // Using a RefCell and Rc is almost unavoidable here:
     // The request_animation_frame callback needs to borrow World so it can see
     // what it should render. It needs access to World.
@@ -302,7 +352,7 @@ impl World {
         let clos: Closure<dyn Fn()> = Closure::new(move || { 
             let fut_this = Rc::clone(&clos_this);
             wasm_bindgen_futures::spawn_local(async move {
-                let t = fut_this.lock().await;
+                let mut t = fut_this.lock().await;
                 t.frame().await;
             });
         });
@@ -371,12 +421,12 @@ impl World {
         self.window.request_animation_frame(clos.as_ref().unchecked_ref()).expect("Unable to set requestAnimationFrame");
     }
 
-    fn map_and_filter_lines<'a>(
+    fn map_and_filter_lines<'b>(
         &self, 
-        proj_3d: &'a (impl Projection<CoordGeo, Coord3D>), 
-        proj_2d: &'a OrthogonalProjection, 
-        inp_lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a)
-    -> impl Iterator<Item=impl Iterator<Item=DrawOp> + 'a> + 'a {
+        proj_3d: &'b (impl Projection<CoordGeo, Coord3D>), 
+        proj_2d: &'b OrthogonalProjection, 
+        inp_lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'b> + 'b)
+    -> impl Iterator<Item=impl Iterator<Item=DrawOp> + 'b> + 'b {
 
         let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
         let scale = Scale2D { x: scale_fac, y: scale_fac };
@@ -386,6 +436,10 @@ impl World {
             inp_lines.into_iter()
             .map(move |x| { project(proj_3d, x.into_iter()) })
             .map(move |line| { 
+                //let (it1, it2): (impl Iterator<Item = Coord3D>, impl Iterator<Item = Coord3D>) = line.map(|x| {(x, x)} ).unzip();
+                //it2.take();
+                //let (it1, it2) : (impl Iterator<Item=Coord3D>, impl Iterator<Item=Coord3D>) = duplicate_iter(line);
+
                 let mut culled_last = true;
                 let mut draw_ops = Vec::<DrawOp>::new();
                 for p_3d in line {
@@ -406,30 +460,20 @@ impl World {
         lines
     }
 
-    async fn frame(&self) {
+    async fn frame(&mut self) {
 
         let proj_3d = SphereProjection;
         let proj_2d = proj_from_angles(self.cur_yaw, self.cur_pitch);
 
         self.context.clear_rect(0.0, 0.0, self.width, self.height);
 
-        let n_lines = 18;
-        let resolution = 36; 
-        let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
+        let lines = (self.get_lines_it)();
 
-        let lat_lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lat_lines);
-        let lon_lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lon_lines);
+        let lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lines);
 
-        //let lat_lines: Vec<Vec<Coord2D>> = lat_lines.map(|x|{x.collect()}).collect();
-        //web_sys::console::log_1(&lat_lines.iter().map(|x| { x.into_iter().map(|x|{x.to_string()}).fold(String::new(), |a,e| { format!("{}, {}", a, e) }) }).fold(String::new(), |a, e|{format!("{}\n{}", a, e)}).into());
-        lat_lines.for_each(|mut l| { 
+        lines.enumerate().for_each(|(i, mut l)| { 
             self.context.set_line_width(1.0);
-            self.context.set_stroke_style_str("rgba(0,0,0,0.5)");
-            draw_line(&self.context, &mut l) 
-        } );
-        lon_lines.enumerate().for_each(|(i, mut l)| { 
-            self.context.set_line_width(2.0);
-            self.context.set_stroke_style_str(format!("hsl({}deg 100% 50%", ((i as f64)/(n_lines as f64)*360.0).to_string()).as_str());
+            self.context.set_stroke_style_str(format!("hsl({}deg 100% 50%", ((i as f64)/(18.0 as f64)*360.0).to_string()).as_str());
             draw_line(&self.context, &mut l) 
         } );
 
@@ -508,6 +552,37 @@ fn proj_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
 
 #[wasm_bindgen]
 pub fn main() {
+
+    //let shp = Shapefile::from_bytes(BOUNDARIES_SHP);
+    let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
+    let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
+
+    //let counts = 
+    //    shp.iter_shapes().fold([0,0,0,0,0,0,0,0,0,0,0,0,0,0], |acc, el| {
+    //        let mut acc = acc.clone();
+    //        if let Ok(s) = el {
+    //            match s {
+    //                shapefile::record::Shape::NullShape                                => acc[0] += 1,
+    //                shapefile::record::Shape::Point(p)                           => acc[1] += 1,
+    //                shapefile::record::Shape::PointM(p)                         => acc[2] += 1,
+    //                shapefile::record::Shape::PointZ(p)                         => acc[3] += 1,
+    //                shapefile::record::Shape::Polyline(p)       => acc[4] += 1,
+    //                shapefile::record::Shape::PolylineM(p)     => acc[5] += 1,
+    //                shapefile::record::Shape::PolylineZ(p)     => acc[6] += 1,
+    //                shapefile::record::Shape::Polygon(p)         => acc[7] += 1,
+    //                shapefile::record::Shape::PolygonM(p)       => acc[8] += 1,
+    //                shapefile::record::Shape::PolygonZ(p)       => acc[9] += 1,
+    //                shapefile::record::Shape::Multipoint(p)   => acc[10] += 1,
+    //                shapefile::record::Shape::MultipointM(p) => acc[11] += 1,
+    //                shapefile::record::Shape::MultipointZ(p) => acc[12] += 1,
+    //                shapefile::record::Shape::Multipatch(p)                 => acc[13] += 1
+    //            }
+    //        }
+    //        acc
+    //    });
+    
+    //web_sys::console::log_1(&counts.map(|x|{x.to_string()}).join(", ").into());
+
     let document = web_sys::window().unwrap().document().unwrap();
     let canvas_elem = document.get_element_by_id("canvas").unwrap();
     let canvas: &web_sys::HtmlCanvasElement = canvas_elem
@@ -526,6 +601,32 @@ pub fn main() {
     let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
     let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
 
+    let res = 1.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
+    let mut lines: Vec<Vec<CoordGeo>> = Vec::new();
+    for maybe_shp in shp.iter_shapes() {
+        if let Ok(shp) = maybe_shp {
+            if let shapefile::record::Shape::Polygon(polyshp) = shp {
+                for ring in polyshp.rings() {
+                    if let shapefile::record::polygon::PolygonRing::Outer(line) = ring {
+                        let mut out_line = Vec::<CoordGeo>::new();
+                        let mut last_p = CoordGeo { latitude: line[0].y, longitude: line[0].x };
+                        out_line.push(last_p.clone());
+                        for point in &line[1..] {
+                            let this_p = CoordGeo{latitude: point.y, longitude: point.x};
+                            if f64::abs(last_p.latitude - this_p.latitude) > res || f64::abs(last_p.longitude - this_p.longitude) > res {
+                                last_p = this_p;
+                                out_line.push(this_p.clone());
+                            }
+                        }
+                        lines.push(out_line)
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
     let wrld = World { 
         window: web_sys::window().unwrap(),
         render_closure: None,
@@ -534,7 +635,46 @@ pub fn main() {
         height: canvas_height,
         cur_yaw: 0.0,
         cur_pitch: f64::to_radians(0.0),
-        cur_bounce_direction: BounceDirection::BounceUp(0.5)
+        cur_bounce_direction: BounceDirection::BounceUp(0.5),
+        get_lines_it: move || { 
+            lines.clone().into_iter().map(|x|{x.into_iter()})
+
+            // Lat lon line rendering
+            //let n_lines = 18;
+            //let resolution = 36; 
+            //let (lat_lines, lon_lines) = gen_lat_lon_lines(n_lines, resolution);
+            //lon_lines
+            //lat_lines.chain(lon_lines)
+
+            // Problem with the following: shp.iter_shapes() can only be consumed once;
+            // after that it appears to yield infinite Error()s, leading to infinite
+            // looping
+            // shp.iter_shapes().filter_map(|maybe_shp| {
+            //     match maybe_shp {
+            //         Err(_) => Option::None,
+            //         Ok(shp) => {
+            //             match shp {
+            //                 shapefile::record::Shape::Polygon(polyshp) => Option::Some (
+            //                     polyshp.rings().iter().fold(Vec::<CoordGeo>::new(), |mut acc, el| {
+            //                         match el {
+            //                             shapefile::record::polygon::PolygonRing::Inner(p) => acc,
+            //                             shapefile::record::polygon::PolygonRing::Outer(p) => {
+            //                                 acc.extend(p.into_iter().map(|x|{
+            //                                     let out = CoordGeo{latitude: x.x, longitude: x.y};
+            //                                     web_sys::console::log_1(&out.to_string().into());
+            //                                     out
+            //                                 }));
+            //                                 acc
+            //                             }
+            //                         }
+            //                     })
+            //                 ),
+            //                 otherwise => Option::None
+            //             }
+            //         }
+            //     }
+            // }).collect::<Vec<Vec<CoordGeo>>>().into_iter().map(|x|{x.into_iter()})
+        }
     };
     let moved_world = wrld.wrap();
     World::init(&moved_world);

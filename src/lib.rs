@@ -1,3 +1,17 @@
+/*
+TODO:
+[ ] Fix culling issues (lines connecting visible and culled points do not get
+    drawn, which at times leads to bad shapes)
+[ ] Fix off-by-one error on lat/lon lines
+[ ] Properly keep track of elapsed time between frames instead of advancing by
+    a fixed amount
+[ ] Figure out why I'm having to do negative latitudes to get a right-side up
+    (North pole up) globe currently. Probably a mistake in the projection
+[ ] Add zoom/pan capabilities to projection
+[ ] Add user interaction
+[ ] Be smarter about shape simplification (currently only looking at +/- 1 deg
+    difference)
+*/
 mod utils;
 mod geometry;
 mod drawing;

@@ -1,6 +1,8 @@
 use std::fmt;
 use std::ops;
 
+use crate::console_log;
+
 // --------------------------------------------------------------------------
 // CoordGeo
 
@@ -123,6 +125,148 @@ impl Projection<CoordGeo, Coord3D> for SphereProjection {
         Coord3D { x: r * f64::cos(-lat) * f64::cos(lon),
                   y: r * f64::cos(-lat) * f64::sin(lon),
                   z: r * f64::sin(-lat) }
+    }
+}
+
+impl Projection<Coord3D, CoordGeo> for SphereProjection {
+    fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
+        let r = 1.0;
+        CoordGeo {
+            latitude: f64::asin(z / r),
+            longitude: f64::atan2(*y, *x)
+        }
+    }
+}
+
+
+//fn matmul<const M: usize, const K: usize, const N: usize>(a: &[f64], b: &[f64]) -> [f64; M*N] {
+//    let mut out = [0.0;M*N];
+//    for row in 0..M {
+//        for col in 0..N {
+//            let mut acc = 0.0;
+//            for k in 0..K {
+//                acc += a[row*K+k] * b[k*K+col];
+//            }
+//            out[row*N+col] = acc;
+//        }
+//    }
+//    out
+//}
+
+macro_rules! inline_matmul {
+    ( $M:literal x $K:literal x $N:literal ( $a:expr, $b:expr ) ) => {
+        {
+            let a = $a;
+            let b = $b;
+            let mut c = [0.0;$M*$N];
+            for row in 0..$M {
+                for col in 0..$N {
+                    let mut acc = 0.0;
+                    for k in 0..$K {
+                        acc += a[row*$K+k] * b[k*$N+col];
+                    }
+                    c[row*$N+col] = acc;
+                }
+            };
+            c
+        }
+    }
+}
+
+fn matmul() {
+    let a = [0.0; 9];
+    let b = [0.0; 9];
+    let x = inline_matmul!(3 x 3 x 1 (a, b));
+}
+
+//fn matmul_3x3x3(a: &[f64; 9], b: &[f64; 9]) -> &[f64; 9] {
+//    [
+//        
+//    ]
+//}
+
+fn rotate(input: &Coord3D, &Coord3D { x: x, y: y, z: z }: &Coord3D, angle: f64) -> Coord3D {
+    let sin = f64::sin(angle);
+    let cos = f64::cos(angle);
+    let [x, y, z] = inline_matmul!(3 x 3 x 1 ( [
+        x*x*(1.0-cos)+cos,    x*y*(1.0-cos)-z*sin,  x*z*(1.0-cos)+y*sin,
+        x*y*(1.0-cos)+z*sin,  y*y*(1.0-cos)+cos,    y*z*(1.0-cos)-x*sin,   
+        x*z*(1.0-cos)-y*sin,  y*z*(1.0-cos)+x*sin,  z*z*(1.0-cos)+cos
+    ], [input.x, input.y, input.z] ));
+    Coord3D { x: x, y: y, z: z }
+}
+
+// This struct contains everything needed to cull points based on what would be
+// invisible on an orthogonally projected sphere looking straight at a defined
+// center point, i.e. equator and meridian. Everything outside of 180 deg 
+// longitude of the center point in the new coordinate system centered around
+// `center` will be culled (latitude <= 90 deg is assumed)
+pub struct OrthogonalSphereCulling {
+    new_x_axis: Coord3D,  // calculated based off rotation from (0,0) to center
+    new_y_axis: Coord3D,
+    new_z_axis: Coord3D
+}
+
+impl OrthogonalSphereCulling {
+    pub fn new(center: CoordGeo) -> Self {
+        let CoordGeo { latitude: lat, longitude: lon } = center;
+        // New basis
+        // There are an infinite number of basis vectors we could choose that
+        // have `center` as the intersection of meridian and equator (they 
+        // could be rotated around it arbitrarily). We choose one by starting
+        // with the basis vectors x=(1,0,0), y=(0,1,0), z=(0,0,1) and rotating
+        // them by `latitude` about the Y axis first, which places the equator 
+        // going through that latitude, and then rotating everything about the
+        // NEW Z axis by `longitude` so the meridian goes through that point.
+        // It's critical that in the second step, we use the new (rotated) Z 
+        // axis.
+        let lat = f64::to_radians(lat);
+        let lon = f64::to_radians(lon);
+        let new_z_axis = 
+            rotate(&Coord3D { x: 0.0, y: 0.0, z: 1.0 },
+                   &Coord3D { x: 0.0, y: 1.0, z: 0.0 },
+                   lat);
+        let new_y_axis =
+                rotate(
+                    &Coord3D { x: 0.0, y: 1.0, z: 0.0},
+                    &new_z_axis,
+                    lon
+                );
+        let new_x_axis =
+                rotate(
+                    &rotate (
+                        &Coord3D { x: 1.0, y: 0.0, z: 0.0},
+                        &Coord3D { x: 0.0, y: 1.0, z: 0.0},
+                        lat
+                    ),
+                    &new_z_axis,
+                    lon
+                );
+                
+        Self {
+            new_x_axis: new_x_axis,
+            new_y_axis: new_y_axis,
+            new_z_axis: new_z_axis
+        }
+    }
+
+    pub fn cull(&self, input: &CoordGeo) -> bool {
+        let xyz_proj = SphereProjection;
+        // Project into XYZ coordinates
+        let inp_xyz = xyz_proj.project(input);
+        //console_log!("{} is {} in XYZ", input, inp_xyz);
+        // Change basis using `center` as the equator/meridian
+        let change_of_basis = [
+            self.new_x_axis.x,  self.new_y_axis.x,  self.new_z_axis.x,
+            self.new_x_axis.y,  self.new_y_axis.y,  self.new_z_axis.y,
+            self.new_x_axis.z,  self.new_y_axis.z,  self.new_z_axis.z,
+        ];
+        let new_xyz = inline_matmul! ( 3 x 3 x 1 (change_of_basis, [inp_xyz.x, inp_xyz.y, inp_xyz.z]));
+        new_xyz[1] > 0.0
+        // Now convert back to lat lon based off new basis
+        //let longitude = f64::atan(new_xyz[1]/new_xyz[0]);
+        //console_log!("orig lon: {} new lon: {}", input.longitude, f64::to_degrees(longitude));
+        //longitude > 0.0 //f64::to_radians(45.0)
     }
 }
 

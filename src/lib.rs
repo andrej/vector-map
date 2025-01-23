@@ -25,6 +25,9 @@ use drawing::*;
 
 const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/geoBoundariesCGAZ_ADM0.shp");
 
+// Disable req_animation_frame and update_state loop for debugging
+const ANIMATE: bool = false;
+
 enum BounceDirection {
     BounceUp(f64),
     BounceDown(f64)
@@ -129,28 +132,30 @@ where
             this1.lock().await.req_animation_frame();
         });
         let this2 = Rc::clone(&this);
-        wasm_bindgen_futures::spawn_local(async move {
-            loop {
-                World::update_state(&this2).await;
-            }
-        });
+        if ANIMATE {
+            wasm_bindgen_futures::spawn_local(async move {
+                loop {
+                    World::update_state(&this2).await;
+                }
+            });
+        }
     }
 
     async fn update_state(this: &Rc<Mutex<Self>>) -> () {
         let mut cur_yaw: f64;
         {
             let t = &mut *this.lock().await;
-            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 1.0) % 360.0);
+            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 0.5) % 360.0);
             match t.cur_bounce_direction {
                 BounceDirection::BounceUp(x) => {
                     t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
-                    if t.cur_pitch > f64::to_radians(30.0) {
+                    if t.cur_pitch > f64::to_radians(5.0) {
                         t.cur_bounce_direction = BounceDirection::BounceDown(-0.2);
                     }
                 }
                 BounceDirection::BounceDown(x) => {
                     t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
-                    if t.cur_pitch < f64::to_radians(-30.0) {
+                    if t.cur_pitch < f64::to_radians(-0.0) {
                         t.cur_bounce_direction = BounceDirection::BounceUp(0.3);
                     }
                 }
@@ -181,9 +186,25 @@ where
         let scale = Scale2D { x: scale_fac, y: scale_fac };
         let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
 
+        let cull = OrthogonalSphereCulling::new(
+            CoordGeo { 
+                latitude: f64::to_degrees(self.cur_pitch), 
+                longitude: f64::to_degrees(self.cur_yaw)
+            }
+        );
+
         let lines = 
             inp_lines.into_iter()
-            .map(move |x| { (x.stroke_style, x.fill_style, project(proj_3d, x.points.into_iter())) })
+            .map(move |x| { 
+                (x.stroke_style, x.fill_style, 
+                    project(proj_3d, x.points.into_iter()
+                    .filter(
+                        |y|{!cull.cull(y)})
+                    .collect::<Vec<CoordGeo>>()
+                    .into_iter()
+                    )
+                )
+            })
             .map(move |(ss, fs, line)| { 
                 //let (it1, it2): (impl Iterator<Item = Coord3D>, impl Iterator<Item = Coord3D>) = line.map(|x| {(x, x)} ).unzip();
                 //it2.take();
@@ -192,7 +213,7 @@ where
                 let mut culled_last = true;
                 let mut draw_ops = Vec::<DrawOp>::new();
                 for p_3d in line {
-                    let cull_this = proj_2d.cull(&p_3d, 0.0);
+                    let cull_this = false; //proj_2d.cull(&p_3d, 0.0);
                     let p_2d = translate.transform(&scale.transform(&proj_2d.project(&p_3d)));
                     if !cull_this {
                         draw_ops.push(if culled_last {
@@ -230,7 +251,9 @@ where
             draw_line(&self.context, &mut l) 
         } );
 
-        self.req_animation_frame();
+        if ANIMATE {
+            self.req_animation_frame();
+        }
     }
 }
 
@@ -306,6 +329,8 @@ fn proj_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
 #[wasm_bindgen]
 pub fn main() {
 
+    utils::set_panic_hook();
+
     //let shp = Shapefile::from_bytes(BOUNDARIES_SHP);
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
@@ -350,7 +375,7 @@ pub fn main() {
     let country_stroke_style = Box::new(String::from("#000"));
     let country_stroke_style = Box::leak(country_stroke_style);
 
-    let res = 1.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
+    let res = 2.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
     for maybe_shp in shp.iter_shapes() {
         if let Ok(shp) = maybe_shp {
             if let shapefile::record::Shape::Polygon(polyshp) = shp {
@@ -385,8 +410,8 @@ pub fn main() {
         context: context,
         width: canvas_width,
         height: canvas_height,
-        cur_yaw: 0.0,
-        cur_pitch: f64::to_radians(0.0),
+        cur_yaw: f64::to_radians(230.0),
+        cur_pitch: f64::to_radians(5.0),
         cur_bounce_direction: BounceDirection::BounceUp(0.5),
         get_lines_it: move || { 
             lines.clone().into_iter() //.map(|x|{x.into_iter()})

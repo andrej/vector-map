@@ -15,3 +15,10 @@ macro_rules! console_log {
         web_sys::console::log_1(&format!($fmt, $($args),*).into())
     }
 }
+
+// see https://rustwasm.github.io/wasm-bindgen/examples/performance.html
+fn perf_to_system(amt: f64) -> std::time::SystemTime {
+    let secs = (amt as u64) / 1_000;
+    let nanos = (((amt as u64) % 1_000) as u32) * 1_000_000;
+    std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+}

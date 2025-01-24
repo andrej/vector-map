@@ -3,7 +3,7 @@ TODO:
 [ ] Fix culling issues (lines connecting visible and culled points do not get
     drawn, which at times leads to bad shapes)
 [ ] Fix off-by-one error on lat/lon lines
-[ ] Properly keep track of elapsed time between frames instead of advancing by
+[x] Properly keep track of elapsed time between frames instead of advancing by
     a fixed amount
 [ ] Figure out why I'm having to do negative latitudes to get a right-side up
     (North pole up) globe currently. Probably a mistake in the projection
@@ -26,7 +26,7 @@ use drawing::*;
 const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/geoBoundariesCGAZ_ADM0.shp");
 
 // Disable req_animation_frame and update_state loop for debugging
-const ANIMATE: bool = false;
+const ANIMATE: bool = true;
 
 enum BounceDirection {
     BounceUp(f64),
@@ -57,14 +57,17 @@ where
     T2: Iterator<Item=CoordGeo>
 {
     window: web_sys::Window,
+    performance: web_sys::Performance,
     context: web_sys::CanvasRenderingContext2d,
     width: f64,
     height: f64,
-    render_closure: Option<Closure<dyn Fn()>>,
+    render_closure: Option<Closure<dyn Fn(f64)>>,
     cur_yaw: f64,
     cur_pitch: f64,
     cur_bounce_direction: BounceDirection,
     get_lines_it: F,
+    last_frame_t: f64,
+    last_state_update_t: f64
 }
 
 impl<F, T1, T2> World<'static, F, T1, T2>
@@ -73,6 +76,40 @@ where
     T1: Iterator<Item=GeoLine<'static, T2>> + 'static,
     T2: Iterator<Item=CoordGeo> + 'static
 {
+    fn new(window: web_sys::Window, canvas_id: &str, get_lines_it: F) -> Self {
+        let document = window.document().unwrap();
+        let canvas_elem = document.get_element_by_id(canvas_id).unwrap();
+        let canvas: &web_sys::HtmlCanvasElement = canvas_elem
+            .dyn_ref::<web_sys::HtmlCanvasElement>()
+            .expect("element with ID #canvas should be a <canvas> in index.html");
+        let context = canvas
+            .get_context("2d")
+            .expect("browser should provide a 2d context")
+            .unwrap()
+            .dyn_into::<web_sys::CanvasRenderingContext2d>()
+            .expect("should be a CanvasRenderingContext2D object");
+
+        let get_u32_attr_with_default = |el: &web_sys::Element, attr: &str, default: u32| -> u32 {
+            el.get_attribute(attr).and_then(|x| x.parse::<u32>().ok()).unwrap_or(default)
+        };
+        let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
+        let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
+        Self {
+            window: web_sys::window().unwrap(),
+            performance: window.performance().expect("performance should be available"),
+            render_closure: None,
+            context: context,
+            width: canvas_width,
+            height: canvas_height,
+            cur_yaw: f64::to_radians(230.0),
+            cur_pitch: f64::to_radians(5.0),
+            cur_bounce_direction: BounceDirection::BounceUp(0.5),
+            get_lines_it: get_lines_it,
+            last_frame_t: 0.0,
+            last_state_update_t: 0.0
+        }
+    }
+
     // Using a RefCell and Rc is almost unavoidable here:
     // The request_animation_frame callback needs to borrow World so it can see
     // what it should render. It needs access to World.
@@ -101,11 +138,11 @@ where
 
     fn init(this: &Rc<Mutex<Self>>) -> () {
         let clos_this = Rc::clone(&this);
-        let clos: Closure<dyn Fn()> = Closure::new(move || { 
+        let clos: Closure<dyn Fn(f64)> = Closure::new(move |time: f64| { 
             let fut_this = Rc::clone(&clos_this);
             wasm_bindgen_futures::spawn_local(async move {
                 let mut t = fut_this.lock().await;
-                t.frame().await;
+                t.frame(time).await;
             });
         });
         //(*this).as_ref().borrow_mut().render_closure = Some(clos);
@@ -144,24 +181,33 @@ where
     async fn update_state(this: &Rc<Mutex<Self>>) -> () {
         let mut cur_yaw: f64;
         {
-            let t = &mut *this.lock().await;
-            t.cur_yaw = f64::to_radians((f64::to_degrees(t.cur_yaw) - 0.5) % 360.0);
-            match t.cur_bounce_direction {
+            let this = &mut *this.lock().await;
+            let t_cur = this.performance.now();
+            let t_diff = t_cur - this.last_state_update_t;
+            this.last_state_update_t = t_cur;
+            let t_diff_s = t_diff/1e3;
+            let yaw_speed = 10.0; // [deg/s]
+            let pitch_speed = 3.0; // [deg/s]
+            let yaw_inc = yaw_speed * t_diff_s;
+            this.cur_yaw = f64::to_radians((f64::to_degrees(this.cur_yaw) - yaw_inc) % 360.0);
+            match this.cur_bounce_direction {
                 BounceDirection::BounceUp(x) => {
-                    t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
-                    if t.cur_pitch > f64::to_radians(5.0) {
-                        t.cur_bounce_direction = BounceDirection::BounceDown(-0.2);
+                    let pitch_inc = x * t_diff_s;
+                    this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + pitch_inc));
+                    if this.cur_pitch > f64::to_radians(5.0) {
+                        this.cur_bounce_direction = BounceDirection::BounceDown(-pitch_speed);
                     }
                 }
                 BounceDirection::BounceDown(x) => {
-                    t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + x));
-                    if t.cur_pitch < f64::to_radians(-0.0) {
-                        t.cur_bounce_direction = BounceDirection::BounceUp(0.3);
+                    let pitch_inc = x * t_diff_s;
+                    this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + pitch_inc));
+                    if this.cur_pitch < f64::to_radians(-0.0) {
+                        this.cur_bounce_direction = BounceDirection::BounceUp(pitch_speed);
                     }
                 }
             }
-            //t.cur_pitch = f64::to_radians((f64::to_degrees(t.cur_pitch) + 1.0) % 10.0);
-            cur_yaw = t.cur_yaw;
+            //this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + 1.0) % 10.0);
+            cur_yaw = this.cur_yaw;
         }
         // It is critical this sleep is outside of the above block; otherwise
         // the lock on `this` is apparently held for the entire time we are
@@ -234,7 +280,10 @@ where
         lines
     }
 
-    async fn frame(&mut self) {
+    async fn frame(&mut self, t: f64) {
+
+        let tdiff = t - self.last_frame_t;
+        self.last_frame_t = t;
 
         let proj_3d = SphereProjection;
         let proj_2d = proj_from_angles(self.cur_yaw, self.cur_pitch);
@@ -250,6 +299,9 @@ where
             self.context.set_stroke_style_str(format!("hsl({}deg 100% 50%", ((i as f64)/(18.0 as f64)*360.0).to_string()).as_str());
             draw_line(&self.context, &mut l) 
         } );
+
+        self.context.fill_text(&format!("{:3.0} ms since last frame", tdiff), 20.0, 20.0);
+        self.context.fill_text(&format!("{:3.0} FPS", 1.0/(tdiff/1e3)), 20.0, 40.0);
 
         if ANIMATE {
             self.req_animation_frame();
@@ -335,23 +387,6 @@ pub fn main() {
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
 
-    let document = web_sys::window().unwrap().document().unwrap();
-    let canvas_elem = document.get_element_by_id("canvas").unwrap();
-    let canvas: &web_sys::HtmlCanvasElement = canvas_elem
-        .dyn_ref::<web_sys::HtmlCanvasElement>()
-        .expect("element with ID #canvas should be a <canvas> in index.html");
-    let context = canvas
-        .get_context("2d")
-        .expect("browser should provide a 2d context")
-        .unwrap()
-        .dyn_into::<web_sys::CanvasRenderingContext2d>()
-        .expect("should be a CanvasRenderingContext2D object");
-
-    let get_u32_attr_with_default = |el: &web_sys::Element, attr: &str, default: u32| -> u32 {
-        el.get_attribute(attr).and_then(|x| x.parse::<u32>().ok()).unwrap_or(default)
-    };
-    let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
-    let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
 
     let mut lines: Vec<GeoLine<<Vec<CoordGeo> as IntoIterator>::IntoIter>> = Vec::new();
 
@@ -404,23 +439,14 @@ pub fn main() {
         }
     }
 
-    let wrld = World { 
-        window: web_sys::window().unwrap(),
-        render_closure: None,
-        context: context,
-        width: canvas_width,
-        height: canvas_height,
-        cur_yaw: f64::to_radians(230.0),
-        cur_pitch: f64::to_radians(5.0),
-        cur_bounce_direction: BounceDirection::BounceUp(0.5),
-        get_lines_it: move || { 
+    let moved_world = World::new(
+        web_sys::window().expect("should have a window"),
+        &"canvas",
+        move || { 
             lines.clone().into_iter() //.map(|x|{x.into_iter()})
         }
-    };
-    let moved_world = wrld.wrap();
+    ).wrap();
     World::init(&moved_world);
     World::run(&moved_world);
-
-    web_sys::console::log_2(&canvas_width.to_string().into(), &canvas_height.to_string().into());
 
 }

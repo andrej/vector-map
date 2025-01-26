@@ -2,7 +2,7 @@
 TODO:
 [ ] Fix culling issues (lines connecting visible and culled points do not get
     drawn, which at times leads to bad shapes)
-[ ] Fix off-by-one error on lat/lon lines
+[x] Fix off-by-one error on lat/lon lines
 [x] Properly keep track of elapsed time between frames instead of advancing by
     a fixed amount
 [ ] Figure out why I'm having to do negative latitudes to get a right-side up
@@ -19,7 +19,6 @@ mod drawing;
 
 use wasm_bindgen::prelude::*;
 use std::rc::Rc;
-use std::cell::RefCell;
 use futures::lock::Mutex;
 
 use geometry::*;
@@ -52,186 +51,67 @@ where It: Iterator<Item=CoordGeo>
     fill_style: Option<&'a String>
 }
 
-struct World
-{
-    window: web_sys::Window,
-    performance: web_sys::Performance,
-    context: web_sys::CanvasRenderingContext2d,
-    width: f64,
-    height: f64,
-    render_closure: Option<Closure<dyn Fn(f64)>>,
-    cur_yaw: f64,
-    cur_pitch: f64,
+/// This is a small struct that contains all the necessary context for a to-be-
+/// drawn frame. Values like the projection parameters and the stroke/fill
+/// styles need to live all the way until the actual drawing takes place, since
+/// values aren't calculated until the last moment. We will pass this struct
+/// along with the actual iterator of drawing operations to keep these necessary
+/// contextual bits of information alive.
+struct World {
+    yaw: f64,
+    pitch: f64,
+    proj_3d: SphereProjection,
+    proj_2d: OrthogonalProjection,
+    latlon_stroke_style: &'static str,
+    country_outlines_stroke_style: &'static str,
+    country_outlines_fill_style: &'static str,
+    country_outlines: Vec<Vec<CoordGeo>>,
     cur_bounce_direction: BounceDirection,
-    last_state_update_t: f64,
-    state: Option<FrameDrawOpsContext>
 }
 
-impl World
-{
-    fn new(window: web_sys::Window, canvas_id: &str, state: Option<FrameDrawOpsContext>) -> Self {
-        let document = window.document().unwrap();
-        let canvas_elem = document.get_element_by_id(canvas_id).unwrap();
-        let canvas: &web_sys::HtmlCanvasElement = canvas_elem
-            .dyn_ref::<web_sys::HtmlCanvasElement>()
-            .expect("element with ID #canvas should be a <canvas> in index.html");
-        let context = canvas
-            .get_context("2d")
-            .expect("browser should provide a 2d context")
-            .unwrap()
-            .dyn_into::<web_sys::CanvasRenderingContext2d>()
-            .expect("should be a CanvasRenderingContext2D object");
-
-        let get_u32_attr_with_default = |el: &web_sys::Element, attr: &str, default: u32| -> u32 {
-            el.get_attribute(attr).and_then(|x| x.parse::<u32>().ok()).unwrap_or(default)
-        };
-        let canvas_width = get_u32_attr_with_default(&canvas_elem, "width", 400) as f64;
-        let canvas_height = get_u32_attr_with_default(&canvas_elem, "height", 400) as f64;
+impl World {
+    fn new() -> Self {
         Self {
-            window: web_sys::window().unwrap(),
-            performance: window.performance().expect("performance should be available"),
-            render_closure: None,
-            context: context,
-            width: canvas_width,
-            height: canvas_height,
-            cur_yaw: f64::to_radians(230.0),
-            cur_pitch: f64::to_radians(5.0),
+            yaw: f64::to_radians(230.0),
+            pitch: f64::to_radians(5.0),
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
-            last_state_update_t: 0.0,
-            state: state
         }
     }
+}
 
-    // Using a RefCell and Rc is almost unavoidable here:
-    // The request_animation_frame callback needs to borrow World so it can see
-    // what it should render. It needs access to World.
-    // However, that callback may get called at any time in the future by the
-    // browser; hence the requirement of web_sys for the callback to have a 
-    // 'static lifetime.
-
-    // At the same time, if we want to be able to modify the world to render
-    // at all, we are going to need to take mutable references to it at some
-    // point. Thus, to enable this, we must use dynamic borrow checking 
-    // implemented in RefCell. Rc allows us to hold multiple references to this
-    // RefCell using reference counting.
-
-    // An alternative approach would be to create a new closure for each
-    // rendering frame, then call any functionality needed to update the state
-    // of the world from within the rendering frame closure. The last thing the 
-    // closure would do is move `self` into a new, next closure for the next 
-    // rendering frame. This would preserve borrow semantics, since no borrows
-    // would overlap (the state updating function would require a mutable ref
-    // to self, but it would return and then let the rendering function inspect
-    // the state of the world after it is done).
-    fn wrap(self) -> Rc<Mutex<Self>> {
-        let this = Rc::new(Mutex::new(self));
-        this
-    }
-
-    fn init(this: &Rc<Mutex<Self>>) -> () {
-        let clos_this = Rc::clone(&this);
-        let clos: Closure<dyn Fn(f64)> = Closure::new(move |time: f64| { 
-            let fut_this = Rc::clone(&clos_this);
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut t = fut_this.lock().await;
-                t.frame(time).await;
-            });
-        });
-        //(*this).as_ref().borrow_mut().render_closure = Some(clos);
-
-        let another_this = Rc::clone(&this);
-        wasm_bindgen_futures::spawn_local(async move {
-            another_this.lock().await.render_closure = Some(clos);
-        });
-    }
-
-    fn run(this: &Rc<Mutex<Self>>) -> () {
-        // Kick off rendering loop; this is the first request_animation frame,
-        // then subsequent calls to the same function are made form within 
-        // frame() to keep it going. 
-        // Since frame is async we can preempt it with state updates
-        let this1 = Rc::clone(&this);
-        wasm_bindgen_futures::spawn_local(async move {
-            loop {
-                if this1.lock().await.render_closure.is_some() {
-                    break;
-                }
-                utils::sleep(10).await;
-            }
-            this1.lock().await.req_animation_frame();
-        });
-        let this2 = Rc::clone(&this);
-        if ANIMATE {
-            wasm_bindgen_futures::spawn_local(async move {
-                loop {
-                    World::update_state(&this2).await;
-                }
-            });
-        }
-    }
-
-    async fn update_state(this: &Rc<Mutex<Self>>) -> () {
-        let mut cur_yaw: f64;
-        {
-            let this = &mut *this.lock().await;
-            let t_cur = this.performance.now();
-            let t_diff = t_cur - this.last_state_update_t;
-            this.last_state_update_t = t_cur;
-            let t_diff_s = t_diff/1e3;
-            let yaw_speed = 10.0; // [deg/s]
-            let pitch_speed = 3.0; // [deg/s]
-            let yaw_inc = yaw_speed * t_diff_s;
-            this.cur_yaw = f64::to_radians((f64::to_degrees(this.cur_yaw) - yaw_inc) % 360.0);
-            match this.cur_bounce_direction {
-                BounceDirection::BounceUp(x) => {
-                    let pitch_inc = x * t_diff_s;
-                    this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + pitch_inc));
-                    if this.cur_pitch > f64::to_radians(5.0) {
-                        this.cur_bounce_direction = BounceDirection::BounceDown(-pitch_speed);
-                    }
-                }
-                BounceDirection::BounceDown(x) => {
-                    let pitch_inc = x * t_diff_s;
-                    this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + pitch_inc));
-                    if this.cur_pitch < f64::to_radians(-0.0) {
-                        this.cur_bounce_direction = BounceDirection::BounceUp(pitch_speed);
-                    }
+impl CanvasRenderLoopState for World
+{
+    type DrawOpsIterT = impl Iterator<Item=DrawOp<Coord2D>>;
+    fn update(&mut self, t_diff: f64) -> () {
+        let t_diff_s = t_diff/1e3;
+        let yaw_speed = 10.0; // [deg/s]
+        let pitch_speed = 3.0; // [deg/s]
+        let yaw_inc = yaw_speed * t_diff_s;
+        self.yaw = f64::to_radians((f64::to_degrees(self.yaw) - yaw_inc) % 360.0);
+        match self.cur_bounce_direction {
+            BounceDirection::BounceUp(x) => {
+                let pitch_inc = x * t_diff_s;
+                self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
+                if self.pitch > f64::to_radians(5.0) {
+                    self.cur_bounce_direction = BounceDirection::BounceDown(-pitch_speed);
                 }
             }
-            //this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + 1.0) % 10.0);
-            cur_yaw = this.cur_yaw;
-            update_state(&mut this.state, this.cur_yaw, this.cur_pitch);
+            BounceDirection::BounceDown(x) => {
+                let pitch_inc = x * t_diff_s;
+                self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
+                if self.pitch < f64::to_radians(-0.0) {
+                    self.cur_bounce_direction = BounceDirection::BounceUp(pitch_speed);
+                }
+            }
         }
-        // It is critical this sleep is outside of the above block; otherwise
-        // the lock on `this` is apparently held for the entire time we are
-        // sleeping
-        utils::sleep(20).await;
+        //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
+        let yaw = self.yaw;
+        update_state(&mut self, self.yaw, self.pitch);
     }
 
-    fn req_animation_frame(&self) {
-        let clos = self.render_closure.as_ref().unwrap();
-        self.window.request_animation_frame(clos.as_ref().unchecked_ref()).expect("Unable to set requestAnimationFrame");
-    }
-
-    async fn frame(&mut self, t: f64) {
-        let tstart = self.performance.now();
-
-        self.context.clear_rect(0.0, 0.0, self.width, self.height);
-        let draw_ops = gen_frame_draw_ops(&self.state);
-        if let Some(draw_ops) = draw_ops {
-            draw_ops.for_each(|op| { 
-                op.draw(&self.context);
-            });
-        }
-
-        let tend = self.performance.now();
-        let tdiff = tend-tstart;
-        self.context.fill_text(&format!("{:3.0} ms to render this frame", tdiff), 20.0, 20.0);
-        self.context.fill_text(&format!("{:3.0} FPS", 1.0/(tdiff/1e3)), 20.0, 40.0);
-
-        if ANIMATE {
-            self.req_animation_frame();
-        }
+    fn frame(&self) {
+        let draw_ops = gen_frame_draw_ops(&self);
+        draw_ops
     }
 }
 
@@ -321,22 +201,6 @@ fn project_lines<'a>(
     })
 }
 
-/// This is a small struct that contains all the necessary context for a to-be-
-/// drawn frame. Values like the projection parameters and the stroke/fill
-/// styles need to live all the way until the actual drawing takes place, since
-/// values aren't calculated until the last moment. We will pass this struct
-/// along with the actual iterator of drawing operations to keep these necessary
-/// contextual bits of information alive.
-struct FrameDrawOpsContext {
-    yaw: f64,
-    pitch: f64,
-    proj_3d: SphereProjection,
-    proj_2d: OrthogonalProjection,
-    latlon_stroke_style: &'static str,
-    country_outlines_stroke_style: &'static str,
-    country_outlines_fill_style: &'static str,
-    country_outlines: Vec<Vec<CoordGeo>>
-}
 
 fn update_state(context: &mut Option<FrameDrawOpsContext>, yaw: f64, pitch: f64) -> () {
     if let Some(ctx) = context {

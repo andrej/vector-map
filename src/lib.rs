@@ -12,12 +12,14 @@ TODO:
 [ ] Be smarter about shape simplification (currently only looking at +/- 1 deg
     difference)
 */
+mod copy;
 mod utils;
 mod geometry;
 mod drawing;
 
 use wasm_bindgen::prelude::*;
 use std::rc::Rc;
+use std::cell::RefCell;
 use futures::lock::Mutex;
 
 use geometry::*;
@@ -50,11 +52,7 @@ where It: Iterator<Item=CoordGeo>
     fill_style: Option<&'a String>
 }
 
-struct World<'a, F, T1, T2>
-where
-    F: FnMut() -> T1,
-    T1: Iterator<Item=GeoLine<'a, T2>>,
-    T2: Iterator<Item=CoordGeo>
+struct World
 {
     window: web_sys::Window,
     performance: web_sys::Performance,
@@ -65,18 +63,13 @@ where
     cur_yaw: f64,
     cur_pitch: f64,
     cur_bounce_direction: BounceDirection,
-    get_lines_it: F,
-    last_frame_t: f64,
-    last_state_update_t: f64
+    last_state_update_t: f64,
+    state: Option<FrameDrawOpsContext>
 }
 
-impl<F, T1, T2> World<'static, F, T1, T2>
-where 
-    F: (FnMut() -> T1) + 'static,
-    T1: Iterator<Item=GeoLine<'static, T2>> + 'static,
-    T2: Iterator<Item=CoordGeo> + 'static
+impl World
 {
-    fn new(window: web_sys::Window, canvas_id: &str, get_lines_it: F) -> Self {
+    fn new(window: web_sys::Window, canvas_id: &str, state: Option<FrameDrawOpsContext>) -> Self {
         let document = window.document().unwrap();
         let canvas_elem = document.get_element_by_id(canvas_id).unwrap();
         let canvas: &web_sys::HtmlCanvasElement = canvas_elem
@@ -104,9 +97,8 @@ where
             cur_yaw: f64::to_radians(230.0),
             cur_pitch: f64::to_radians(5.0),
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
-            get_lines_it: get_lines_it,
-            last_frame_t: 0.0,
-            last_state_update_t: 0.0
+            last_state_update_t: 0.0,
+            state: state
         }
     }
 
@@ -164,7 +156,7 @@ where
                 if this1.lock().await.render_closure.is_some() {
                     break;
                 }
-                sleep(10).await;
+                utils::sleep(10).await;
             }
             this1.lock().await.req_animation_frame();
         });
@@ -208,12 +200,12 @@ where
             }
             //this.cur_pitch = f64::to_radians((f64::to_degrees(this.cur_pitch) + 1.0) % 10.0);
             cur_yaw = this.cur_yaw;
+            update_state(&mut this.state, this.cur_yaw, this.cur_pitch);
         }
         // It is critical this sleep is outside of the above block; otherwise
         // the lock on `this` is apparently held for the entire time we are
         // sleeping
-        //web_sys::console::log_1(&cur_yaw.to_string().into());
-        sleep(20).await;
+        utils::sleep(20).await;
     }
 
     fn req_animation_frame(&self) {
@@ -221,86 +213,20 @@ where
         self.window.request_animation_frame(clos.as_ref().unchecked_ref()).expect("Unable to set requestAnimationFrame");
     }
 
-    fn map_and_filter_lines<'b>(
-        &self, 
-        proj_3d: &'b (impl Projection<CoordGeo, Coord3D>), 
-        proj_2d: &'b OrthogonalProjection, 
-        inp_lines: T1)
-    -> impl Iterator<Item=Line<impl Iterator<Item=DrawOp>>> + 'b {
-
-        let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
-        let scale = Scale2D { x: scale_fac, y: scale_fac };
-        let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
-
-        let cull = OrthogonalSphereCulling::new(
-            CoordGeo { 
-                latitude: f64::to_degrees(self.cur_pitch), 
-                longitude: f64::to_degrees(self.cur_yaw)
-            }
-        );
-
-        let lines = 
-            inp_lines.into_iter()
-            .map(move |x| { 
-                (x.stroke_style, x.fill_style, 
-                    project(proj_3d, x.points.into_iter()
-                    .filter(
-                        |y|{!cull.cull(y)})
-                    .collect::<Vec<CoordGeo>>()
-                    .into_iter()
-                    )
-                )
-            })
-            .map(move |(ss, fs, line)| { 
-                //let (it1, it2): (impl Iterator<Item = Coord3D>, impl Iterator<Item = Coord3D>) = line.map(|x| {(x, x)} ).unzip();
-                //it2.take();
-                //let (it1, it2) : (impl Iterator<Item=Coord3D>, impl Iterator<Item=Coord3D>) = duplicate_iter(line);
-
-                let mut culled_last = true;
-                let mut draw_ops = Vec::<DrawOp>::new();
-                for p_3d in line {
-                    let cull_this = false; //proj_2d.cull(&p_3d, 0.0);
-                    let p_2d = translate.transform(&scale.transform(&proj_2d.project(&p_3d)));
-                    if !cull_this {
-                        draw_ops.push(if culled_last {
-                            DrawOp::MoveTo(p_2d)
-                        } else {
-                            DrawOp::LineTo(p_2d)
-                        });
-                    }
-                    culled_last = cull_this
-                }
-                Line { 
-                    points: draw_ops.into_iter(),
-                    stroke_style: ss,
-                    fill_style: fs
-                }
-            });
-
-        lines
-    }
-
     async fn frame(&mut self, t: f64) {
-
-        let tdiff = t - self.last_frame_t;
-        self.last_frame_t = t;
-
-        let proj_3d = SphereProjection;
-        let proj_2d = proj_from_angles(self.cur_yaw, self.cur_pitch);
+        let tstart = self.performance.now();
 
         self.context.clear_rect(0.0, 0.0, self.width, self.height);
+        let draw_ops = gen_frame_draw_ops(&self.state);
+        if let Some(draw_ops) = draw_ops {
+            draw_ops.for_each(|op| { 
+                op.draw(&self.context);
+            });
+        }
 
-        let lines = (self.get_lines_it)();
-
-        let lines = self.map_and_filter_lines(&proj_3d, &proj_2d, lines);
-
-        lines.enumerate().for_each(|(i, mut l)| { 
-            self.context.set_line_width(1.0);
-            self.context.set_stroke_style_str(format!("hsl({}deg 100% 50%", ((i as f64)/(18.0 as f64)*360.0).to_string()).as_str());
-            draw_line(&self.context, &mut l) 
-        } );
-
-        self.context.fill_text(&format!("{:3.0} ms since last frame", tdiff), 20.0, 20.0);
+        let tend = self.performance.now();
+        let tdiff = tend-tstart;
+        self.context.fill_text(&format!("{:3.0} ms to render this frame", tdiff), 20.0, 20.0);
         self.context.fill_text(&format!("{:3.0} FPS", 1.0/(tdiff/1e3)), 20.0, 40.0);
 
         if ANIMATE {
@@ -309,29 +235,13 @@ where
     }
 }
 
-// credit: anon80458984
-// https://users.rust-lang.org/t/async-sleep-in-rust-wasm32/78218/5
-pub async fn sleep(delay: i32) {
-    let mut cb = 
-        | resolve: wasm_bindgen_futures::js_sys::Function,
-          reject: wasm_bindgen_futures::js_sys::Function | 
-        {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, delay)
-                .expect("unable to use JS setTimeout");
-        };
 
-    let p = wasm_bindgen_futures::js_sys::Promise::new(&mut cb);
-
-    wasm_bindgen_futures::JsFuture::from(p).await.unwrap();
-}
-
+/// Return two iterators, one of latitude lines, and one of longitude lines
 fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl Iterator<Item=CoordGeo>>, impl Iterator<Item=impl Iterator<Item=CoordGeo>>) {
     let lat_lines = 
         (0..n_lines).map(move |lat_i| { 
             let lat: f64 = -90.0 + (lat_i as f64) / (n_lines as f64) * 180.0;
-            (0..resolution).map(move |lon_i| { 
+            (0..(resolution+1)).map(move |lon_i| { 
                 let lon: f64 = -180.0 + (lon_i as f64) / (resolution as f64) * 360.0;
                 //let lon: f64 = -90.0 + (lon_i as f64) / (resolution as f64) * 180.0;
                 CoordGeo { latitude: lat, longitude: lon } 
@@ -342,7 +252,7 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
     let lon_lines =
         (0..n_lines).map(move |lon_i| { 
             let lon: f64 = -90.0 + (lon_i as f64) / (n_lines as f64) * 180.0;
-            (0..resolution).map(move |lat_i| { 
+            (0..(resolution+1)).map(move |lat_i| { 
                 let lat: f64 = -180.0 + (lat_i as f64) / (resolution as f64) * 360.0;
                 CoordGeo { latitude: lat, longitude: lon } 
             })
@@ -350,73 +260,21 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
     (lat_lines, lon_lines)
 }
 
-fn proj_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
-    // First, draw a unit length vector going into space from the origin, at
-    // an angle of `pitch` measured from the XY plane. To get the Z component,
-    // consider the vector the hypothenuse of a triangle, with the Z axis being
-    // the adjacent side of a 90-pitch angle. cos=adj./hyp., so cos(180-pitch)
-    // is the Z height. Since cos(90-pitch) = sin(pitch) we use that.
-    // Now, to figure out the X and Y components, forget about the first 
-    // triangle. Instead, draw a triangle where the hypothenuse lies on the 
-    // XY plane, the unit vector is the adjacent side, and the opposite side
-    // is prependicular to the unit vector, i.e. a right angle floating in
-    // space, pointing down at the XY plane.
-    // The length of the hyptohenuse will not be one (unless pitch is zero).
-    // Draw two more triangles using the hypthenuse of the previous triangle as
-    // its hypothenuse, and the adjacent sides being the X and Y axes, 
-    // respectively, for each triangle.
-    // The yaw angle is the angle between Y axis and the hypothenuse, so
-    // the Y component is cos*hyp = ajd/hyp*hyp = adj. and the X component is
-    // sin*hyp = opp/hyp*hyp = opp.
-    // To get the value of hyp, use cos(yaw).
-    let normal = Coord3D {
-        x: f64::sin(yaw)*f64::cos(pitch),
-        y: f64::cos(yaw)*f64::cos(pitch),
-        z: f64::sin(pitch)
-    };
-    OrthogonalProjection::new_from_normal(normal)
-}
-
-
-#[wasm_bindgen]
-pub fn main() {
-
-    utils::set_panic_hook();
-
-    //let shp = Shapefile::from_bytes(BOUNDARIES_SHP);
+/// Create a vector of country outlines once; we can reuse this vector to
+/// recreate iterators from it each time we need to draw them
+fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
+    let mut country_outlines: Vec<Vec<CoordGeo>> = Vec::new();
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
 
+    let res = 1.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
 
-    let mut lines: Vec<GeoLine<<Vec<CoordGeo> as IntoIterator>::IntoIter>> = Vec::new();
-
-    let n_latlon_lines = 18;
-    let latlon_resolution = 36;
-    let (lat_lines, lon_lines) = gen_lat_lon_lines(n_latlon_lines, latlon_resolution);
-    let latlon_stroke_style = Box::new(String::from("#ccc"));
-    let latlon_stroke_style: &String = Box::leak(latlon_stroke_style); // need to borrow IMMUTABLY here, because each closure below will capture this borrow, and we cannot have multiple mutable borrows
-    lines.extend(
-        lat_lines.map(|x| { GeoLine { points: x.collect::<Vec<CoordGeo>>().into_iter(), stroke_style: Option::Some(latlon_stroke_style), fill_style: Option::None } })
-    );
-    lines.extend(
-        lon_lines.map(|x| { GeoLine { points: x.collect::<Vec<CoordGeo>>().into_iter(), stroke_style: Option::Some(latlon_stroke_style), fill_style: Option::None } })
-    );
-
-    // The following leaks are probably fine because we are essentially doing
-    // the same thing in World::wrap for all other variables. These will all
-    // have to live until the end of program execution
-    let country_fill_style = Box::new(String::from("#019"));
-    let country_fill_style = Box::leak(country_fill_style);
-    let country_stroke_style = Box::new(String::from("#000"));
-    let country_stroke_style = Box::leak(country_stroke_style);
-
-    let res = 2.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
     for maybe_shp in shp.iter_shapes() {
         if let Ok(shp) = maybe_shp {
             if let shapefile::record::Shape::Polygon(polyshp) = shp {
                 for ring in polyshp.rings() {
                     if let shapefile::record::polygon::PolygonRing::Outer(line) = ring {
-                        let mut out_line = Vec::<CoordGeo>::new();
+                        let mut out_line = Vec::<CoordGeo>::with_capacity(line.len());
                         let mut last_p = CoordGeo { latitude: line[0].y, longitude: line[0].x };
                         out_line.push(last_p.clone());
                         for point in &line[1..] {
@@ -426,11 +284,7 @@ pub fn main() {
                                 out_line.push(this_p.clone());
                             }
                         }
-                        lines.push(GeoLine {
-                            points: out_line.into_iter(),
-                            stroke_style: Option::Some(country_stroke_style),
-                            fill_style: Option::Some(country_fill_style)
-                        })
+                        country_outlines.push(out_line)
                     }
                 }
             }
@@ -439,12 +293,127 @@ pub fn main() {
         }
     }
 
+    country_outlines
+}
+
+/// Helper function that takes an iterator of a line and projects its
+/// coordinates
+fn project_lines<'a>(
+    lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a>, 
+    proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
+    proj_2d: &'a impl Projection<Coord3D, To=Coord2D>
+) 
+    -> impl Iterator<Item=impl Iterator<Item=Coord2D> + 'a>
+{
+    //let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
+    //let scale = Scale2D { x: scale_fac, y: scale_fac };
+    //let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
+    let scale_fac = f64::min(600.0*0.8/2.0, 400.0*0.8/2.0);
+    let scale = Scale2D { x: scale_fac, y: scale_fac };
+    let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
+
+    lines.map(move |line| {
+        line.map(move |coord| {
+            let projected = proj_2d.project(&proj_3d.project(&coord));
+            let translated = translate.transform(&scale.transform(&projected));
+            translated
+        })
+    })
+}
+
+/// This is a small struct that contains all the necessary context for a to-be-
+/// drawn frame. Values like the projection parameters and the stroke/fill
+/// styles need to live all the way until the actual drawing takes place, since
+/// values aren't calculated until the last moment. We will pass this struct
+/// along with the actual iterator of drawing operations to keep these necessary
+/// contextual bits of information alive.
+struct FrameDrawOpsContext {
+    yaw: f64,
+    pitch: f64,
+    proj_3d: SphereProjection,
+    proj_2d: OrthogonalProjection,
+    latlon_stroke_style: &'static str,
+    country_outlines_stroke_style: &'static str,
+    country_outlines_fill_style: &'static str,
+    country_outlines: Vec<Vec<CoordGeo>>
+}
+
+fn update_state(context: &mut Option<FrameDrawOpsContext>, yaw: f64, pitch: f64) -> () {
+    if let Some(ctx) = context {
+        ctx.yaw = yaw;
+        ctx.pitch = pitch;
+        ctx.proj_3d = SphereProjection;
+        ctx.proj_2d = OrthogonalProjection::new_from_angles(yaw, pitch);
+    } else {
+        *context = Some(FrameDrawOpsContext {
+            yaw: yaw,
+            pitch: pitch,
+            proj_3d: SphereProjection,
+            proj_2d: OrthogonalProjection::new_from_angles(yaw, pitch),
+            latlon_stroke_style: "#ccc",
+            country_outlines_stroke_style: "#fff",
+            country_outlines_fill_style: "#039",
+            country_outlines: gen_country_outlines()
+        });
+    }
+}
+
+/// Create an iterator of drawing operations for each frame. The idea is that
+/// we store as little as possible in memory -- only things that do not need
+/// to be recomputed between frames are stored in memory. This means that the
+/// latitude/longitude lines never get stored in memory; the iterator creates
+/// them on the fly. The country outlines are stored in memory as absolute 
+/// coordinates, but their projected coordinates change between each frame;
+/// therefore, we map those vectors using projection iterators.
+fn gen_frame_draw_ops<'a>(context: &'a Option<FrameDrawOpsContext>) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
+    if context.is_none() {
+        return Option::None
+    }
+
+    let context = context.as_ref().unwrap();
+
+    // Latitude/longitude line iterator
+    let n_latlon_lines = 18;
+    let latlon_resolution = 36;
+    let (lat_lines, lon_lines) = gen_lat_lon_lines(n_latlon_lines, latlon_resolution);
+
+    // Country outline iterator
+    let country_outlines = context.country_outlines.iter().map(|outline| { outline.iter().map(|point| { *point }) });
+    let country_outlines = country_outlines;
+
+    // Project all lines
+    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d);
+    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d);
+    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d);
+
+    Some(std::iter::once(DrawOp::BeginPath)
+        .chain(lat_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
+        .chain(lon_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
+        .chain(country_outlines
+            .map(coord_iter_into_draw_ops)
+            .map(move |ops| { 
+                ops
+                    .chain(std::iter::once(DrawOp::Stroke(context.country_outlines_stroke_style.to_string())))
+                    .chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string()))) })
+            .flatten())
+    )
+
+}
+
+#[wasm_bindgen]
+pub fn main() {
+    utils::set_panic_hook();
+
+    //let shp = Shapefile::from_bytes(BOUNDARIES_SHP);
+
+    // need to borrow IMMUTABLY here, because each closure below will capture this borrow, and we cannot have multiple mutable borrows
+    // leak should be fine because these styles need to be live for the rest of the program, but FIXME: find more elegant solution
+    // (i.e. pass ownership to the World struct and let it drop this value when it goes out of scope)
+
     let moved_world = World::new(
         web_sys::window().expect("should have a window"),
         &"canvas",
-        move || { 
-            lines.clone().into_iter() //.map(|x|{x.into_iter()})
-        }
+        Option::<FrameDrawOpsContext>::None,
     ).wrap();
     World::init(&moved_world);
     World::run(&moved_world);

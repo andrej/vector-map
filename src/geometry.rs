@@ -112,13 +112,15 @@ impl fmt::Display for Coord2D {
 // --------------------------------------------------------------------------
 // Projection
 
-pub trait Projection<From, To> {
-    fn project(&self, input: &From) -> To;
+pub trait Projection<From> {
+    type To;
+    fn project(&self, input: &From) -> Self::To;
 }
 
 pub struct SphereProjection;
 
-impl Projection<CoordGeo, Coord3D> for SphereProjection {
+impl Projection<CoordGeo> for SphereProjection {
+    type To = Coord3D;
     fn project(&self, input: &CoordGeo) -> Coord3D {
         let r = 1.0;
         let [lat, lon] = [input.latitude, input.longitude].map(f64::to_radians);
@@ -128,7 +130,8 @@ impl Projection<CoordGeo, Coord3D> for SphereProjection {
     }
 }
 
-impl Projection<Coord3D, CoordGeo> for SphereProjection {
+impl Projection<Coord3D> for SphereProjection {
+    type To = CoordGeo;
     fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
         let r = 1.0;
         CoordGeo {
@@ -323,9 +326,38 @@ impl OrthogonalProjection {
             y_axis: y_axis
         }
     }
+    
+
+    pub fn new_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
+        // First, draw a unit length vector going into space from the origin, at
+        // an angle of `pitch` measured from the XY plane. To get the Z component,
+        // consider the vector the hypothenuse of a triangle, with the Z axis being
+        // the adjacent side of a 90-pitch angle. cos=adj./hyp., so cos(180-pitch)
+        // is the Z height. Since cos(90-pitch) = sin(pitch) we use that.
+        // Now, to figure out the X and Y components, forget about the first 
+        // triangle. Instead, draw a triangle where the hypothenuse lies on the 
+        // XY plane, the unit vector is the adjacent side, and the opposite side
+        // is prependicular to the unit vector, i.e. a right angle floating in
+        // space, pointing down at the XY plane.
+        // The length of the hyptohenuse will not be one (unless pitch is zero).
+        // Draw two more triangles using the hypthenuse of the previous triangle as
+        // its hypothenuse, and the adjacent sides being the X and Y axes, 
+        // respectively, for each triangle.
+        // The yaw angle is the angle between Y axis and the hypothenuse, so
+        // the Y component is cos*hyp = ajd/hyp*hyp = adj. and the X component is
+        // sin*hyp = opp/hyp*hyp = opp.
+        // To get the value of hyp, use cos(yaw).
+        let normal = Coord3D {
+            x: f64::sin(yaw)*f64::cos(pitch),
+            y: f64::cos(yaw)*f64::cos(pitch),
+            z: f64::sin(pitch)
+        };
+        OrthogonalProjection::new_from_normal(normal)
+    }
 }
 
-impl Projection<Coord3D, Coord2D> for OrthogonalProjection {
+impl Projection<Coord3D> for OrthogonalProjection {
+    type To = Coord2D;
     fn project(&self, input: &Coord3D) -> Coord2D {
         Coord2D { x:  dot_product(input, &self.x_axis), y: dot_product(input, &self.y_axis) }
     }
@@ -373,34 +405,4 @@ impl Transform<Coord2D> for Scale2D {
     fn transform(&self, input: &Coord2D) -> Coord2D {
         Coord2D { x: input.x * self.x, y: input.y * self.y }
     }
-}
-
-
-pub fn project<'a, A, B>(proj: &'a impl Projection<A, B>, line: impl Iterator<Item=A> + 'a) -> impl Iterator<Item=B> + 'a { 
-    line.map(move |point | { 
-        proj.project(&point)
-    })
-}
-
-// The reason using a generic (e.g. I_out where I_out: Iterator<Item=Coord2d>)
-// for the return type does not work here is that the type that the function
-// returns cannot be named, because it contains closures. Closures have a type
-// that cannot be named. When using generics, the caller would have to specify
-// the concrete return type at the call site; something that is not possible
-// with types containing closuers. Using `impl` allows the compiler to infer 
-// that type. `impl` does not mean dynamic dispatch; the compiler will still
-// monomorphize the code at each call site, that is, specialzie the function
-// for each type that it returns, just like it would for a generic.
-// The reason generics work for the *input* parameters is that the caller is
-// responsible for naming all types: The caller knows the (opaque) types for
-// the iterators it passes in, becaues it has created the closures. However,
-// this function then creates a closure for the returned iterator as well; the
-// caller cannot know or name the type of this closure, since it is created
-// in this function, not the caller.
-pub fn project_generic<'a, A, B, I, P>(proj: &'a P, line: I) -> impl Iterator<Item=B> + 'a
-where 
-    I: Iterator<Item=A> + 'a,
-    P: Projection<A, B> + 'a
-{ 
-    line.map(move |point| { proj.project(&point) })
 }

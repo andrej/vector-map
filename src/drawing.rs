@@ -65,9 +65,8 @@ pub fn coord_iter_into_draw_ops<CoordT>(mut iter: impl Iterator<Item=CoordT>) ->
 
 /// Manages the main render and state update loop by calling into an
 /// impl `CanvasRenderLoopState`
-pub struct CanvasRenderLoop<CanvasRenderLoopStateT, DrawOpIterT>
-where CanvasRenderLoopStateT: CanvasRenderLoopState<DrawOpIterT>,
-DrawOpIterT: Iterator<Item=DrawOp<Coord2D>>
+pub struct CanvasRenderLoop<CanvasRenderLoopStateT>
+where CanvasRenderLoopStateT: CanvasRenderLoopState + 'static
 {
     window: web_sys::Window,
     performance: web_sys::Performance,
@@ -79,10 +78,9 @@ DrawOpIterT: Iterator<Item=DrawOp<Coord2D>>
     last_state_update_t: f64
 }
 
-const ANIMATE: bool = true;
-impl<CanvasRenderLoopStateT, DrawOpIterT> CanvasRenderLoop<CanvasRenderLoopStateT, DrawOpIterT>
-where CanvasRenderLoopStateT: CanvasRenderLoopState<DrawOpIterT> + 'static,
-DrawOpIterT: Iterator<Item=DrawOp<Coord2D>>
+// const ANIMATE: bool = true;
+impl<CanvasRenderLoopStateT> CanvasRenderLoop<CanvasRenderLoopStateT>
+where CanvasRenderLoopStateT: CanvasRenderLoopState
 {
     pub fn new(window: web_sys::Window, canvas_id: &str, state: CanvasRenderLoopStateT) -> Self {
         let document = window.document().unwrap();
@@ -224,9 +222,9 @@ DrawOpIterT: Iterator<Item=DrawOp<Coord2D>>
     }
 }
 
-pub trait CanvasRenderLoopState<DrawOpsIterT>
-where DrawOpsIterT: Iterator<Item=DrawOp<Coord2D>>
+pub trait CanvasRenderLoopState
 {
-    fn frame(&self) -> Option<DrawOpsIterT>;
+    fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
+    where 'a: 'b;
     fn update(&mut self, t_diff: f64);
 }

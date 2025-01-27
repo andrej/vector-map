@@ -60,28 +60,35 @@ where It: Iterator<Item=CoordGeo>
 struct World {
     yaw: f64,
     pitch: f64,
+    country_outlines: Vec<Vec<CoordGeo>>,
+    cur_bounce_direction: BounceDirection,
     proj_3d: SphereProjection,
     proj_2d: OrthogonalProjection,
     latlon_stroke_style: &'static str,
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
-    country_outlines: Vec<Vec<CoordGeo>>,
-    cur_bounce_direction: BounceDirection,
 }
 
 impl World {
     fn new() -> Self {
+        let yaw = f64::to_radians(230.0);
+        let pitch = f64::to_radians(5.0);
         Self {
-            yaw: f64::to_radians(230.0),
-            pitch: f64::to_radians(5.0),
+            yaw: yaw,
+            pitch: pitch,
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
+            proj_3d: SphereProjection,
+            proj_2d: OrthogonalProjection::new_from_angles(yaw, pitch),
+            latlon_stroke_style: "#ccc",
+            country_outlines_stroke_style: "#fff",
+            country_outlines_fill_style: "#039",
+            country_outlines: gen_country_outlines()
         }
     }
 }
 
 impl CanvasRenderLoopState for World
 {
-    type DrawOpsIterT = impl Iterator<Item=DrawOp<Coord2D>>;
     fn update(&mut self, t_diff: f64) -> () {
         let t_diff_s = t_diff/1e3;
         let yaw_speed = 10.0; // [deg/s]
@@ -105,13 +112,19 @@ impl CanvasRenderLoopState for World
             }
         }
         //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
-        let yaw = self.yaw;
-        update_state(&mut self, self.yaw, self.pitch);
+        self.proj_3d = SphereProjection;
+        self.proj_2d = OrthogonalProjection::new_from_angles(self.yaw, self.pitch);
     }
 
-    fn frame(&self) {
+    fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
+    where 'a: 'b
+    {
         let draw_ops = gen_frame_draw_ops(&self);
-        draw_ops
+        if let Some(draw_ops) = draw_ops {
+            Option::Some(Box::new(draw_ops))
+        } else {
+            Option::None
+        }
     }
 }
 
@@ -201,27 +214,6 @@ fn project_lines<'a>(
     })
 }
 
-
-fn update_state(context: &mut Option<FrameDrawOpsContext>, yaw: f64, pitch: f64) -> () {
-    if let Some(ctx) = context {
-        ctx.yaw = yaw;
-        ctx.pitch = pitch;
-        ctx.proj_3d = SphereProjection;
-        ctx.proj_2d = OrthogonalProjection::new_from_angles(yaw, pitch);
-    } else {
-        *context = Some(FrameDrawOpsContext {
-            yaw: yaw,
-            pitch: pitch,
-            proj_3d: SphereProjection,
-            proj_2d: OrthogonalProjection::new_from_angles(yaw, pitch),
-            latlon_stroke_style: "#ccc",
-            country_outlines_stroke_style: "#fff",
-            country_outlines_fill_style: "#039",
-            country_outlines: gen_country_outlines()
-        });
-    }
-}
-
 /// Create an iterator of drawing operations for each frame. The idea is that
 /// we store as little as possible in memory -- only things that do not need
 /// to be recomputed between frames are stored in memory. This means that the
@@ -229,13 +221,7 @@ fn update_state(context: &mut Option<FrameDrawOpsContext>, yaw: f64, pitch: f64)
 /// them on the fly. The country outlines are stored in memory as absolute 
 /// coordinates, but their projected coordinates change between each frame;
 /// therefore, we map those vectors using projection iterators.
-fn gen_frame_draw_ops<'a>(context: &'a Option<FrameDrawOpsContext>) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
-    if context.is_none() {
-        return Option::None
-    }
-
-    let context = context.as_ref().unwrap();
-
+fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
     // Latitude/longitude line iterator
     let n_latlon_lines = 18;
     let latlon_resolution = 36;
@@ -274,12 +260,9 @@ pub fn main() {
     // leak should be fine because these styles need to be live for the rest of the program, but FIXME: find more elegant solution
     // (i.e. pass ownership to the World struct and let it drop this value when it goes out of scope)
 
-    let moved_world = World::new(
-        web_sys::window().expect("should have a window"),
-        &"canvas",
-        Option::<FrameDrawOpsContext>::None,
-    ).wrap();
-    World::init(&moved_world);
-    World::run(&moved_world);
+    let world = World::new();
+    let draw_loop = CanvasRenderLoop::new(web_sys::window().unwrap(), "canvas", world).wrap();
+    CanvasRenderLoop::<World>::init(&draw_loop);
+    CanvasRenderLoop::<World>::run(&draw_loop);
 
 }

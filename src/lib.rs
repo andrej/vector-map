@@ -12,7 +12,6 @@ TODO:
 [ ] Be smarter about shape simplification (currently only looking at +/- 1 deg
     difference)
 */
-mod copy;
 mod utils;
 mod geometry;
 mod drawing;
@@ -64,6 +63,7 @@ struct World {
     cur_bounce_direction: BounceDirection,
     proj_3d: SphereProjection,
     proj_2d: OrthogonalProjection,
+    culler: OrthogonalSphereCulling,
     latlon_stroke_style: &'static str,
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
@@ -78,7 +78,8 @@ impl World {
             pitch: pitch,
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
             proj_3d: SphereProjection,
-            proj_2d: OrthogonalProjection::new_from_angles(yaw, pitch),
+            proj_2d: OrthogonalProjection::new_from_angles(pitch, yaw),
+            culler: OrthogonalSphereCulling::new(CoordGeo { latitude: pitch, longitude: yaw }),
             latlon_stroke_style: "#ccc",
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
@@ -113,7 +114,8 @@ impl CanvasRenderLoopState for World
         }
         //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
         self.proj_3d = SphereProjection;
-        self.proj_2d = OrthogonalProjection::new_from_angles(self.yaw, self.pitch);
+        self.proj_2d = OrthogonalProjection::new_from_angles(self.pitch, self.yaw);
+        self.culler = OrthogonalSphereCulling::new(CoordGeo { latitude: self.pitch, longitude: self.yaw })
     }
 
     fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
@@ -137,7 +139,10 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
             (0..(resolution+1)).map(move |lon_i| { 
                 let lon: f64 = -180.0 + (lon_i as f64) / (resolution as f64) * 360.0;
                 //let lon: f64 = -90.0 + (lon_i as f64) / (resolution as f64) * 180.0;
-                CoordGeo { latitude: lat, longitude: lon } 
+                CoordGeo { 
+                    latitude: f64::to_radians(lat), 
+                    longitude: f64::to_radians(lon)
+                } 
             })
         });
     // I'm assuming `move` in the closure here probably works because n_lines
@@ -147,7 +152,10 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
             let lon: f64 = -90.0 + (lon_i as f64) / (n_lines as f64) * 180.0;
             (0..(resolution+1)).map(move |lat_i| { 
                 let lat: f64 = -180.0 + (lat_i as f64) / (resolution as f64) * 360.0;
-                CoordGeo { latitude: lat, longitude: lon } 
+                CoordGeo { 
+                    latitude: f64::to_radians(lat), 
+                    longitude: f64::to_radians(lon)
+                } 
             })
         });
     (lat_lines, lon_lines)
@@ -160,7 +168,7 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
 
-    let res = 1.0; // degrees latitude/longitude difference to be included TODO: proper shape simplification
+    let res = f64::to_radians(1.0); // degrees latitude/longitude difference to be included TODO: proper shape simplification
 
     for maybe_shp in shp.iter_shapes() {
         if let Ok(shp) = maybe_shp {
@@ -168,10 +176,16 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
                 for ring in polyshp.rings() {
                     if let shapefile::record::polygon::PolygonRing::Outer(line) = ring {
                         let mut out_line = Vec::<CoordGeo>::with_capacity(line.len());
-                        let mut last_p = CoordGeo { latitude: line[0].y, longitude: line[0].x };
+                        let mut last_p = CoordGeo { 
+                            latitude: f64::to_radians(line[0].y), 
+                            longitude: f64::to_radians(line[0].x)
+                        };
                         out_line.push(last_p.clone());
                         for point in &line[1..] {
-                            let this_p = CoordGeo{latitude: point.y, longitude: point.x};
+                            let this_p = CoordGeo { 
+                                latitude: f64::to_radians(point.y), 
+                                longitude: f64::to_radians(point.x)
+                            };
                             if f64::abs(last_p.latitude - this_p.latitude) > res || f64::abs(last_p.longitude - this_p.longitude) > res {
                                 last_p = this_p;
                                 out_line.push(this_p.clone());
@@ -194,7 +208,7 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
 fn project_lines<'a>(
     lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a>, 
     proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
-    proj_2d: &'a impl Projection<Coord3D, To=Coord2D>
+    proj_2d: &'a impl Projection<Coord3D, To=Coord2D>,
 ) 
     -> impl Iterator<Item=impl Iterator<Item=Coord2D> + 'a>
 {
@@ -202,15 +216,20 @@ fn project_lines<'a>(
     //let scale = Scale2D { x: scale_fac, y: scale_fac };
     //let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
     let scale_fac = f64::min(600.0*0.8/2.0, 400.0*0.8/2.0);
-    let scale = Scale2D { x: scale_fac, y: scale_fac };
-    let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
 
-    lines.map(move |line| {
-        line.map(move |coord| {
-            let projected = proj_2d.project(&proj_3d.project(&coord));
-            let translated = translate.transform(&scale.transform(&projected));
-            translated
-        })
+    lines.filter_map(move |line| {
+        let mut projected = proj_2d.project(proj_3d.project(line));
+        let first_point = projected.next();
+        if let Some(first_point) = first_point {
+            Option::Some(projected.chain(std::iter::once(first_point)).map(move |coord| {
+                // TODO: move below transforms into World struct
+                let scale = Scale2D { x: scale_fac, y: scale_fac };
+                let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
+                translate.transform(&scale.transform(&coord))
+            }))
+        } else {
+            Option::None
+        }
     })
 }
 

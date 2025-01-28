@@ -114,30 +114,39 @@ impl fmt::Display for Coord2D {
 
 pub trait Projection<From> {
     type To;
-    fn project(&self, input: &From) -> Self::To;
+    fn project(&self, input: impl Iterator<Item=From>) -> impl Iterator<Item=Self::To>;
 }
 
 pub struct SphereProjection;
 
 impl Projection<CoordGeo> for SphereProjection {
     type To = Coord3D;
-    fn project(&self, input: &CoordGeo) -> Coord3D {
+    fn project(&self, input: impl Iterator<Item=CoordGeo>) -> impl Iterator<Item=Coord3D> {
         let r = 1.0;
-        let [lat, lon] = [input.latitude, input.longitude].map(f64::to_radians);
-        Coord3D { x: r * f64::cos(-lat) * f64::cos(lon),
-                  y: r * f64::cos(-lat) * f64::sin(lon),
-                  z: r * f64::sin(-lat) }
+        input.map(move |CoordGeo { latitude: lat, longitude: lon } | {
+            Coord3D { x: r * f64::cos(-lat) * f64::cos(lon),
+                    y: r * f64::cos(-lat) * f64::sin(lon),
+                    z: r * f64::sin(-lat) }
+        })
     }
 }
 
-impl Projection<Coord3D> for SphereProjection {
-    type To = CoordGeo;
-    fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
-        let r = 1.0;
-        CoordGeo {
-            latitude: f64::asin(z / r),
-            longitude: f64::atan2(*y, *x)
-        }
+// impl Projection<Coord3D> for SphereProjection {
+//     type To = CoordGeo;
+//     fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
+//         let r = 1.0;
+//         CoordGeo {
+//             latitude: f64::asin(z / r),
+//             longitude: f64::atan2(*y, *x)
+//         }
+//     }
+// }
+
+fn project_coord3d_to_coordgeo(Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
+    let r = 1.0;
+    CoordGeo {
+        latitude: f64::asin(z / r),
+        longitude: f64::atan2(*y, *x)
     }
 }
 
@@ -223,8 +232,8 @@ impl OrthogonalSphereCulling {
         // NEW Z axis by `longitude` so the meridian goes through that point.
         // It's critical that in the second step, we use the new (rotated) Z 
         // axis.
-        let lat = f64::to_radians(lat);
-        let lon = f64::to_radians(lon);
+        let lat = -lat; // FIXME
+        let lon = -lon; // FIXME
         let new_z_axis = 
             rotate(&Coord3D { x: 0.0, y: 0.0, z: 1.0 },
                    &Coord3D { x: 0.0, y: 1.0, z: 0.0 },
@@ -256,7 +265,7 @@ impl OrthogonalSphereCulling {
     pub fn cull(&self, input: &CoordGeo) -> bool {
         let xyz_proj = SphereProjection;
         // Project into XYZ coordinates
-        let inp_xyz = xyz_proj.project(input);
+        let inp_xyz = xyz_proj.project(std::iter::once(*input)).next().unwrap();
         //console_log!("{} is {} in XYZ", input, inp_xyz);
         // Change basis using `center` as the equator/meridian
         let change_of_basis = [
@@ -265,24 +274,33 @@ impl OrthogonalSphereCulling {
             self.new_x_axis.z,  self.new_y_axis.z,  self.new_z_axis.z,
         ];
         let new_xyz = inline_matmul! ( 3 x 3 x 1 (change_of_basis, [inp_xyz.x, inp_xyz.y, inp_xyz.z]));
-        new_xyz[1] > 0.0
+        //new_xyz[1] > 0.0
         // Now convert back to lat lon based off new basis
-        //let longitude = f64::atan(new_xyz[1]/new_xyz[0]);
-        //console_log!("orig lon: {} new lon: {}", input.longitude, f64::to_degrees(longitude));
-        //longitude > 0.0 //f64::to_radians(45.0)
+        let mut longitude = f64::signum(new_xyz[1]) * (f64::atan(f64::abs(new_xyz[1])/f64::abs(new_xyz[0])) + if new_xyz[0] < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
+        //console_log!("lon: {}", f64::to_degrees(longitude));
+        if longitude > f64::to_radians(90.0) {
+            longitude = f64::to_radians(90.0);
+        } else if longitude < f64::to_radians(-90.0) {
+            longitude = f64::to_radians(-90.0);
+        }
+        false
     }
 }
 
 pub struct OrthogonalProjection {
     x_axis: Coord3D,
-    y_axis: Coord3D
+    y_axis: Coord3D,
+    z_axis: Coord3D
 }
 
 impl OrthogonalProjection {
     pub fn new(x_axis: Coord3D, y_axis: Coord3D) -> OrthogonalProjection {
+        let x_axis = normalize(&x_axis);
+        let y_axis = normalize(&y_axis);
         OrthogonalProjection {
-            x_axis: normalize(&x_axis),
-            y_axis: normalize(&y_axis)
+            x_axis: x_axis,
+            y_axis: y_axis,
+            z_axis: cross_product(&x_axis, &y_axis)
         }
     }
 
@@ -317,18 +335,15 @@ impl OrthogonalProjection {
             }
         };
         // Project it onto the plane normal to `normal`
-        let y_axis = normalize(&project_onto_plane(&normal, &v));
+        let y_axis = project_onto_plane(&normal, &v);
         // Find a vector orthogonal to both x_axis and `normal`.
         // By making it orthogonal to `normal` it is guaranteed to lie in the plane.
-        let x_axis = normalize(&cross_product(&normal, &y_axis));
-        OrthogonalProjection {
-            x_axis: x_axis,
-            y_axis: y_axis
-        }
+        let x_axis = cross_product(&normal, &y_axis);
+        OrthogonalProjection::new(x_axis, y_axis)
     }
     
 
-    pub fn new_from_angles(yaw: f64, pitch: f64) -> OrthogonalProjection {
+    pub fn new_from_angles(latitude: f64, longitude: f64) -> OrthogonalProjection {
         // First, draw a unit length vector going into space from the origin, at
         // an angle of `pitch` measured from the XY plane. To get the Z component,
         // consider the vector the hypothenuse of a triangle, with the Z axis being
@@ -348,18 +363,61 @@ impl OrthogonalProjection {
         // sin*hyp = opp/hyp*hyp = opp.
         // To get the value of hyp, use cos(yaw).
         let normal = Coord3D {
-            x: f64::sin(yaw)*f64::cos(pitch),
-            y: f64::cos(yaw)*f64::cos(pitch),
-            z: f64::sin(pitch)
+            x: f64::cos(longitude) * f64::cos(latitude),
+            y: f64::sin(longitude) * f64::cos(latitude),
+            z: f64::sin(latitude)
         };
         OrthogonalProjection::new_from_normal(normal)
+    }
+
+    fn project_single_with_depth(&self, input: Coord3D) -> Coord3D {
+        Coord3D { 
+            x: dot_product(&input, &self.x_axis), 
+            y: dot_product(&input, &self.y_axis),
+            z: dot_product(&input, &self.z_axis)
+        }
     }
 }
 
 impl Projection<Coord3D> for OrthogonalProjection {
     type To = Coord2D;
-    fn project(&self, input: &Coord3D) -> Coord2D {
-        Coord2D { x:  dot_product(input, &self.x_axis), y: dot_product(input, &self.y_axis) }
+
+    fn project(&self, input: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=Coord2D> {
+        let mut last = Option::<Coord3D>::None;
+        input.filter_map(move |coord| {
+            let projected = self.project_single_with_depth(coord); Coord2D { 
+                x:  dot_product(&coord, &self.x_axis), 
+                y: dot_product(&coord, &self.y_axis)
+            };
+            let z = dot_product(&coord, &self.z_axis);
+            if z > 0.0 {
+                last = Option::Some(projected);
+                Option::Some(Coord2D { x: projected.x, y: projected.y })
+            } else {
+                if let Some(last_coord) = last {
+                    // The previous coordinate was visible, but this one is invisible (back side of the globe);
+                    // this means there is some point between the last point and this one that is at the edge
+                    // of the globe. We should clamp this coordinate to that last visible position.
+                    let this_rev = project_coord3d_to_coordgeo(&projected);
+                    let last_rev = project_coord3d_to_coordgeo(&last_coord);
+                    let lat_slope = (this_rev.latitude - last_rev.latitude) / (this_rev.longitude - last_rev.longitude);
+                    let lon = f64::signum(last_rev.longitude) * f64::to_radians(90.0);
+                    let edge_rev = CoordGeo {
+                        longitude: lon,
+                        latitude: 0.0 //lat_slope * last_rev.longitude
+                    };
+                    let sphere_proj = SphereProjection;
+                    let edge = sphere_proj.project(std::iter::once(edge_rev)).next().unwrap();
+                    last = Option::None;
+                    Option::Some(Coord2D {
+                        x: dot_product(&edge, &self.x_axis),
+                        y: dot_product(&edge, &self.y_axis)
+                    })
+                } else {
+                    Option::None
+                }
+            }
+        })
     }
 }
 

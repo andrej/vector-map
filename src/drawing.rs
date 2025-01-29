@@ -16,6 +16,7 @@ pub enum DrawOp<CoordT> {
     ClosePath,
     Stroke(String),
     Fill(String),
+    BigRedCircle(CoordT),
 }
 
 impl DrawOp<Coord2D> {
@@ -45,6 +46,11 @@ impl DrawOp<Coord2D> {
             DrawOp::Fill(style) => {
                 //console_log!("set fill style {}", style);
                 context.set_fill_style_str(style);
+                context.fill();
+            },
+            DrawOp::BigRedCircle(Coord2D { x, y}) => {
+                context.arc(*x, *y, 4.0, 0.0, 2.0*std::f64::consts::PI);
+                context.set_fill_style_str("red");
                 context.fill();
             }
         }
@@ -78,7 +84,6 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState + 'static
     last_state_update_t: f64
 }
 
-// const ANIMATE: bool = true;
 impl<CanvasRenderLoopStateT> CanvasRenderLoop<CanvasRenderLoopStateT>
 where CanvasRenderLoopStateT: CanvasRenderLoopState
 {
@@ -172,13 +177,14 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
             this1.lock().await.req_animation_frame();
         });
         let this2 = Rc::clone(&this);
-        if ANIMATE {
-            wasm_bindgen_futures::spawn_local(async move {
-                loop {
-                    CanvasRenderLoop::update(&this2).await;
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                CanvasRenderLoop::update(&this2).await;
+                if !ANIMATE {
+                    break;
                 }
-            });
-        }
+            }
+        });
     }
 
     async fn update(this: &Rc<Mutex<Self>>) -> () {

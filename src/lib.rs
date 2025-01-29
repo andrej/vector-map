@@ -27,6 +27,9 @@ const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/
 
 // Disable req_animation_frame and update_state loop for debugging
 const ANIMATE: bool = true;
+const DEBUG_POINTS: [CoordGeo; 1] = [
+    CoordGeo { latitude: 0.0, longitude: 0.0 }
+];
 
 enum BounceDirection {
     BounceUp(f64),
@@ -63,7 +66,6 @@ struct World {
     cur_bounce_direction: BounceDirection,
     proj_3d: SphereProjection,
     proj_2d: OrthogonalProjection,
-    culler: OrthogonalSphereCulling,
     latlon_stroke_style: &'static str,
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
@@ -71,15 +73,14 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let yaw = f64::to_radians(230.0);
-        let pitch = f64::to_radians(5.0);
+        let yaw = f64::to_radians(0.0);
+        let pitch = f64::to_radians(0.0);
         Self {
             yaw: yaw,
             pitch: pitch,
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
             proj_3d: SphereProjection,
             proj_2d: OrthogonalProjection::new_from_angles(pitch, yaw),
-            culler: OrthogonalSphereCulling::new(CoordGeo { latitude: pitch, longitude: yaw }),
             latlon_stroke_style: "#ccc",
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
@@ -115,7 +116,6 @@ impl CanvasRenderLoopState for World
         //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
         self.proj_3d = SphereProjection;
         self.proj_2d = OrthogonalProjection::new_from_angles(self.pitch, self.yaw);
-        self.culler = OrthogonalSphereCulling::new(CoordGeo { latitude: self.pitch, longitude: self.yaw })
     }
 
     fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
@@ -168,7 +168,7 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
 
-    let res = f64::to_radians(1.0); // degrees latitude/longitude difference to be included TODO: proper shape simplification
+    let res = f64::to_radians(5.0); // degrees latitude/longitude difference to be included TODO: proper shape simplification
 
     for maybe_shp in shp.iter_shapes() {
         if let Ok(shp) = maybe_shp {
@@ -250,6 +250,9 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
     let country_outlines = context.country_outlines.iter().map(|outline| { outline.iter().map(|point| { *point }) });
     let country_outlines = country_outlines;
 
+    // Debug points
+    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d);
+
     // Project all lines
     let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d);
     let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d);
@@ -265,6 +268,9 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
                     .chain(std::iter::once(DrawOp::Stroke(context.country_outlines_stroke_style.to_string())))
                     .chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string()))) })
             .flatten())
+        .chain(debug_points.map(|l| { l.map(|p| {
+            DrawOp::BigRedCircle(p)
+        }) }).flatten())
     )
 
 }

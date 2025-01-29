@@ -144,9 +144,10 @@ impl Projection<CoordGeo> for SphereProjection {
 
 fn project_coord3d_to_coordgeo(Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
     let r = 1.0;
+    //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
     CoordGeo {
-        latitude: f64::asin(z / r),
-        longitude: f64::atan2(*y, *x)
+        latitude: f64::asin(y / r),
+        longitude: f64::atan2(*x, *z),
     }
 }
 
@@ -302,6 +303,11 @@ impl OrthogonalProjection {
             y_axis: y_axis,
             z_axis: cross_product(&x_axis, &y_axis)
         }
+        //OrthogonalProjection {
+        //    x_axis: Coord3D { x: 0.0, y: 1.0, z: 0.0 },
+        //    y_axis: Coord3D { x: 0.0, y: 0.0, z: 1.0 },
+        //    z_axis: Coord3D { x: 1.0, y: 0.0, z: 0.0 },
+        //}
     }
 
     pub fn new_from_normal(normal: Coord3D) -> OrthogonalProjection {
@@ -385,12 +391,9 @@ impl Projection<Coord3D> for OrthogonalProjection {
     fn project(&self, input: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=Coord2D> {
         let mut last = Option::<Coord3D>::None;
         input.filter_map(move |coord| {
-            let projected = self.project_single_with_depth(coord); Coord2D { 
-                x:  dot_product(&coord, &self.x_axis), 
-                y: dot_product(&coord, &self.y_axis)
-            };
-            let z = dot_product(&coord, &self.z_axis);
-            if z > 0.0 {
+            let projected = self.project_single_with_depth(coord); 
+            let this_rev = project_coord3d_to_coordgeo(&projected);
+            if projected.z >= 0.0 {
                 last = Option::Some(projected);
                 Option::Some(Coord2D { x: projected.x, y: projected.y })
             } else {
@@ -404,14 +407,17 @@ impl Projection<Coord3D> for OrthogonalProjection {
                     let lon = f64::signum(last_rev.longitude) * f64::to_radians(90.0);
                     let edge_rev = CoordGeo {
                         longitude: lon,
-                        latitude: 0.0 //lat_slope * last_rev.longitude
+                        latitude: last_rev.latitude + lat_slope * (lon - last_rev.longitude)
                     };
+                    //console_log!("last: {},  this: {}, edge: {}", last_rev, this_rev, edge_rev);
                     let sphere_proj = SphereProjection;
                     let edge = sphere_proj.project(std::iter::once(edge_rev)).next().unwrap();
                     last = Option::None;
+                    let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
+                    let uy = Coord3D { x: 0.0, y: 0.0, z: -1.0 };  // FIXME why -1 Z axis??
                     Option::Some(Coord2D {
-                        x: dot_product(&edge, &self.x_axis),
-                        y: dot_product(&edge, &self.y_axis)
+                        x: dot_product(&edge, &ux),
+                        y: dot_product(&edge, &uy)
                     })
                 } else {
                     Option::None
@@ -420,16 +426,6 @@ impl Projection<Coord3D> for OrthogonalProjection {
         })
     }
 }
-
-impl OrthogonalProjection {
-    pub fn cull(&self, input: &Coord3D, distance: f64) -> bool {
-        let normal = cross_product(&self.x_axis, &self.y_axis); 
-            // TODO: optimize this so we don't recaculate normal for every. single. coordinate.
-        //web_sys::console::log_1(&dot_product(input, &normal).to_string().into());
-        dot_product(input, &normal) < distance 
-    }
-}
-
 
 // --------------------------------------------------------------------------
 // Transform

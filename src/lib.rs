@@ -130,7 +130,6 @@ impl CanvasRenderLoopState for World
     }
 }
 
-
 /// Return two iterators, one of latitude lines, and one of longitude lines
 fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl Iterator<Item=CoordGeo>>, impl Iterator<Item=impl Iterator<Item=CoordGeo>>) {
     let lat_lines = 
@@ -176,11 +175,12 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
                 for ring in polyshp.rings() {
                     if let shapefile::record::polygon::PolygonRing::Outer(line) = ring {
                         let mut out_line = Vec::<CoordGeo>::with_capacity(line.len());
-                        let mut last_p = CoordGeo { 
+                        let first_p = CoordGeo { 
                             latitude: f64::to_radians(line[0].y), 
                             longitude: f64::to_radians(line[0].x)
                         };
-                        out_line.push(last_p.clone());
+                        out_line.push(first_p.clone());
+                        let mut last_p = first_p.clone();
                         for point in &line[1..] {
                             let this_p = CoordGeo { 
                                 latitude: f64::to_radians(point.y), 
@@ -191,6 +191,9 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
                                 out_line.push(this_p.clone());
                             }
                         }
+                        // close the path by pushing a copy of the first point
+                        // at the end; this simplifies our culling logic
+                        out_line.push(first_p.clone());
                         country_outlines.push(out_line)
                     }
                 }

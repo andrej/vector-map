@@ -385,45 +385,150 @@ impl OrthogonalProjection {
     }
 }
 
+/// Takes two points, one inside the viewport, the other outside of it, and
+/// returns the intersection of the line between them and the edge of the
+/// visible area.
+fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D {
+    let outside_rev = project_coord3d_to_coordgeo(&outside);
+    let inside_rev = project_coord3d_to_coordgeo(&inside);
+    let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
+    let lon = f64::signum(inside_rev.longitude) * f64::to_radians(90.0);
+    let edge_rev = CoordGeo {
+        longitude: lon,
+        latitude: - inside_rev.latitude + lat_slope * (lon - inside_rev.longitude)
+    };
+    //console_log!("inside: {},  outside: {}, edge: {}", inside_rev, outside_rev, edge_rev);
+    let sphere_proj = SphereProjection;
+    let edge = sphere_proj.project(std::iter::once(edge_rev)).next().unwrap();
+    edge
+}
+
+fn coord3d_to_coord2d_yz_plane(input: Coord3D) -> Coord2D {
+    let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
+    let uy = Coord3D { x: 0.0, y: 0.0, z: 1.0 };  // FIXME why -1 Z axis??
+    Coord2D {
+        x: dot_product(&input, &ux),
+        y: dot_product(&input, &uy)
+    }
+}
+
 impl Projection<Coord3D> for OrthogonalProjection {
     type To = Coord2D;
 
     fn project(&self, input: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=Coord2D> {
-        let mut last = Option::<Coord3D>::None;
-        input.filter_map(move |coord| {
-            let projected = self.project_single_with_depth(coord); 
-            let this_rev = project_coord3d_to_coordgeo(&projected);
-            if projected.z >= 0.0 {
-                last = Option::Some(projected);
-                Option::Some(Coord2D { x: projected.x, y: projected.y })
-            } else {
-                if let Some(last_coord) = last {
-                    // The previous coordinate was visible, but this one is invisible (back side of the globe);
-                    // this means there is some point between the last point and this one that is at the edge
-                    // of the globe. We should clamp this coordinate to that last visible position.
-                    let this_rev = project_coord3d_to_coordgeo(&projected);
-                    let last_rev = project_coord3d_to_coordgeo(&last_coord);
-                    let lat_slope = (this_rev.latitude - last_rev.latitude) / (this_rev.longitude - last_rev.longitude);
-                    let lon = f64::signum(last_rev.longitude) * f64::to_radians(90.0);
-                    let edge_rev = CoordGeo {
-                        longitude: lon,
-                        latitude: last_rev.latitude + lat_slope * (lon - last_rev.longitude)
-                    };
-                    //console_log!("last: {},  this: {}, edge: {}", last_rev, this_rev, edge_rev);
-                    let sphere_proj = SphereProjection;
-                    let edge = sphere_proj.project(std::iter::once(edge_rev)).next().unwrap();
-                    last = Option::None;
-                    let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
-                    let uy = Coord3D { x: 0.0, y: 0.0, z: -1.0 };  // FIXME why -1 Z axis??
-                    Option::Some(Coord2D {
-                        x: dot_product(&edge, &ux),
-                        y: dot_product(&edge, &uy)
-                    })
+        OrthogonalProjectionIterator::new(self, input)
+        //let mut last = Option::<Coord3D>::None;
+        //input.filter_map(move |coord| {
+        //    let projected = self.project_single_with_depth(coord); 
+        //    if projected.z >= 0.0 {
+        //        last = Option::Some(projected);
+        //        Option::Some(Coord2D { x: projected.x, y: projected.y })
+        //    } else {
+        //        if let Some(last_coord) = last {
+        //            // The previous coordinate was visible, but this one is invisible (back side of the globe);
+        //            // this means there is some point between the last point and this one that is at the edge
+        //            // of the globe. We should clamp this coordinate to that last visible position.
+        //            let edge = get_viewport_intersection_point(last_coord, projected);
+        //            last = Option::None;
+        //            let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
+        //            let uy = Coord3D { x: 0.0, y: 0.0, z: 1.0 };  // FIXME why -1 Z axis??
+        //            Option::Some(Coord2D {
+        //                x: dot_product(&edge, &ux),
+        //                y: dot_product(&edge, &uy)
+        //            })
+        //        } else {
+        //            Option::None
+        //        }
+        //    }
+        //})
+    }
+}
+
+struct OrthogonalProjectionIterator<'a, InputIter>
+where InputIter: Iterator<Item=Coord3D> {
+    proj: &'a OrthogonalProjection,
+    iter: InputIter,
+    next: Option<Coord3D>
+}
+
+impl<'a, InputIter> OrthogonalProjectionIterator<'a, InputIter>
+where InputIter: Iterator<Item=Coord3D> {
+    fn new(proj: &'a OrthogonalProjection, mut iter: InputIter) -> Self {
+        let first = iter.next();
+        Self {
+            proj: proj,
+            iter: iter,
+            next: Option::None
+        }
+    }
+}
+
+/*
+last visible    this visible    - project this
+last invisible  this visible    - project clamped last; queue this next
+last visible    this invisible  - project clamped this
+last invisible  this invisibile - move to next coord
+*/
+
+
+impl<'a, InputIter> Iterator for OrthogonalProjectionIterator<'a, InputIter>
+where InputIter: Iterator<Item=Coord3D> {
+    type Item = Coord2D;
+    fn next(&mut self) -> Option<Coord2D> {
+        let mut maybe_cur_projected = if self.next.is_some() { self.next } else { self.iter.next().map(|x| { self.proj.project_single_with_depth(x) }) };
+        self.next = Option::None;
+        loop {
+            let maybe_next_projected = self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
+            if let Some(cur) = maybe_cur_projected {
+                if cur.z < 0.0 {
+                    // current is invisible; we need to advance to a point
+                    // where "next" is visible
+                    if let Some(next) = maybe_next_projected {
+                        if next.z < 0.0 {
+                            // Both current and next are invisible; iterate to
+                            // the next point. If it is visible, we will clamp
+                            // "next" to the point after "next", if not we will
+                            // keep iterating, etc.
+                            maybe_cur_projected = maybe_next_projected;
+                            continue
+                        }
+                        // Current is invisible but next is visible. Clamp 
+                        // current to the last visible point on the line towards
+                        // "next", return it, and enqueue "next" to be used as
+                        // the next point (since we have already taken it out
+                        // of the input iterator).
+                        self.next = maybe_next_projected;
+                        let cur_clamped = get_viewport_intersection_point(next, cur);
+                        break Option::Some(Coord2D{ x: cur_clamped.x, y: cur_clamped.y });
+                    } else {
+                        // Current is invisible and we have no next point to
+                        // draw a line to; yield no more points. Note that we
+                        // will have drawn the last visible point when we
+                        // clamped "next" and enqueued it.
+                        break Option::None
+                    }
                 } else {
-                    Option::None
+                    // current is visible; we can project and return it as-is,
+                    // but we also need to take care of "next". If it is outside
+                    // the visible range, we need to clamp it to the 
+                    // intersection between current and next and enqueue it.
+                    if let Some(next) = maybe_next_projected {
+                        if next.z < 0.0 {
+                            // next is invisible; clamp it and enqueue the
+                            // clamped version
+                            let next_clamped = get_viewport_intersection_point(cur, next);
+                            self.next = Option::Some(next_clamped);
+                        } else {
+                            // next is also visible; just enqueue it as-is
+                            self.next = maybe_next_projected;
+                        }
+                    }
+                    break Option::Some(Coord2D { x: cur.x, y: cur.y })
                 }
+            } else {
+                break Option::None
             }
-        })
+        }
     }
 }
 

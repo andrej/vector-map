@@ -123,168 +123,24 @@ impl Projection<CoordGeo> for SphereProjection {
     type To = Coord3D;
     fn project(&self, input: impl Iterator<Item=CoordGeo>) -> impl Iterator<Item=Coord3D> {
         let r = 1.0;
+        // Positive longitudes are EAST of meridian
+        // Positive latitudes are NORTH of the equator
         input.map(move |CoordGeo { latitude: lat, longitude: lon } | {
-            Coord3D { x: r * f64::cos(-lat) * f64::cos(lon),
-                    y: r * f64::cos(-lat) * f64::sin(lon),
-                    z: r * f64::sin(-lat) }
+            Coord3D { 
+                x: r * f64::cos(-lon) * f64::cos(-lat),
+                y: r * f64::sin(-lon) * f64::cos(-lat),
+                z: r * f64::sin(-lat) 
+            }
         })
     }
 }
-
-// impl Projection<Coord3D> for SphereProjection {
-//     type To = CoordGeo;
-//     fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
-//         let r = 1.0;
-//         CoordGeo {
-//             latitude: f64::asin(z / r),
-//             longitude: f64::atan2(*y, *x)
-//         }
-//     }
-// }
 
 fn project_coord3d_to_coordgeo(Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
     let r = 1.0;
     //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
     CoordGeo {
-        latitude: f64::asin(y / r),
-        longitude: f64::atan2(*x, *z),
-    }
-}
-
-
-//fn matmul<const M: usize, const K: usize, const N: usize>(a: &[f64], b: &[f64]) -> [f64; M*N] {
-//    let mut out = [0.0;M*N];
-//    for row in 0..M {
-//        for col in 0..N {
-//            let mut acc = 0.0;
-//            for k in 0..K {
-//                acc += a[row*K+k] * b[k*K+col];
-//            }
-//            out[row*N+col] = acc;
-//        }
-//    }
-//    out
-//}
-
-macro_rules! inline_matmul {
-    ( $M:literal x $K:literal x $N:literal ( $a:expr, $b:expr ) ) => {
-        {
-            let a = $a;
-            let b = $b;
-            let mut c = [0.0;$M*$N];
-            for row in 0..$M {
-                for col in 0..$N {
-                    let mut acc = 0.0;
-                    for k in 0..$K {
-                        acc += a[row*$K+k] * b[k*$N+col];
-                    }
-                    c[row*$N+col] = acc;
-                }
-            };
-            c
-        }
-    }
-}
-
-fn matmul() {
-    let a = [0.0; 9];
-    let b = [0.0; 9];
-    let x = inline_matmul!(3 x 3 x 1 (a, b));
-}
-
-//fn matmul_3x3x3(a: &[f64; 9], b: &[f64; 9]) -> &[f64; 9] {
-//    [
-//        
-//    ]
-//}
-
-fn rotate(input: &Coord3D, &Coord3D { x: x, y: y, z: z }: &Coord3D, angle: f64) -> Coord3D {
-    let sin = f64::sin(angle);
-    let cos = f64::cos(angle);
-    let [x, y, z] = inline_matmul!(3 x 3 x 1 ( [
-        x*x*(1.0-cos)+cos,    x*y*(1.0-cos)-z*sin,  x*z*(1.0-cos)+y*sin,
-        x*y*(1.0-cos)+z*sin,  y*y*(1.0-cos)+cos,    y*z*(1.0-cos)-x*sin,   
-        x*z*(1.0-cos)-y*sin,  y*z*(1.0-cos)+x*sin,  z*z*(1.0-cos)+cos
-    ], [input.x, input.y, input.z] ));
-    Coord3D { x: x, y: y, z: z }
-}
-
-// This struct contains everything needed to cull points based on what would be
-// invisible on an orthogonally projected sphere looking straight at a defined
-// center point, i.e. equator and meridian. Everything outside of 180 deg 
-// longitude of the center point in the new coordinate system centered around
-// `center` will be culled (latitude <= 90 deg is assumed)
-pub struct OrthogonalSphereCulling {
-    new_x_axis: Coord3D,  // calculated based off rotation from (0,0) to center
-    new_y_axis: Coord3D,
-    new_z_axis: Coord3D
-}
-
-impl OrthogonalSphereCulling {
-    pub fn new(center: CoordGeo) -> Self {
-        let CoordGeo { latitude: lat, longitude: lon } = center;
-        // New basis
-        // There are an infinite number of basis vectors we could choose that
-        // have `center` as the intersection of meridian and equator (they 
-        // could be rotated around it arbitrarily). We choose one by starting
-        // with the basis vectors x=(1,0,0), y=(0,1,0), z=(0,0,1) and rotating
-        // them by `latitude` about the Y axis first, which places the equator 
-        // going through that latitude, and then rotating everything about the
-        // NEW Z axis by `longitude` so the meridian goes through that point.
-        // It's critical that in the second step, we use the new (rotated) Z 
-        // axis.
-        let lat = -lat; // FIXME
-        let lon = -lon; // FIXME
-        let new_z_axis = 
-            rotate(&Coord3D { x: 0.0, y: 0.0, z: 1.0 },
-                   &Coord3D { x: 0.0, y: 1.0, z: 0.0 },
-                   lat);
-        let new_y_axis =
-                rotate(
-                    &Coord3D { x: 0.0, y: 1.0, z: 0.0},
-                    &new_z_axis,
-                    lon
-                );
-        let new_x_axis =
-                rotate(
-                    &rotate (
-                        &Coord3D { x: 1.0, y: 0.0, z: 0.0},
-                        &Coord3D { x: 0.0, y: 1.0, z: 0.0},
-                        lat
-                    ),
-                    &new_z_axis,
-                    lon
-                );
-                
-        Self {
-            new_x_axis: new_x_axis,
-            new_y_axis: new_y_axis,
-            new_z_axis: new_z_axis
-        }
-    }
-
-    pub fn cull(&self, input: &CoordGeo) -> bool {
-        let xyz_proj = SphereProjection;
-        // Project into XYZ coordinates
-        let inp_xyz = xyz_proj.project(std::iter::once(*input)).next().unwrap();
-        //console_log!("{} is {} in XYZ", input, inp_xyz);
-        // Change basis using `center` as the equator/meridian
-        let change_of_basis = [
-            self.new_x_axis.x,  self.new_y_axis.x,  self.new_z_axis.x,
-            self.new_x_axis.y,  self.new_y_axis.y,  self.new_z_axis.y,
-            self.new_x_axis.z,  self.new_y_axis.z,  self.new_z_axis.z,
-        ];
-        let new_xyz = inline_matmul! ( 3 x 3 x 1 (change_of_basis, [inp_xyz.x, inp_xyz.y, inp_xyz.z]));
-        //new_xyz[1] > 0.0
-        // Now convert back to lat lon based off new basis
-        let mut longitude = f64::signum(new_xyz[1]) * (f64::atan(f64::abs(new_xyz[1])/f64::abs(new_xyz[0])) + if new_xyz[0] < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
-        //console_log!("lon: {}", f64::to_degrees(longitude));
-        if longitude > f64::to_radians(90.0) {
-            longitude = f64::to_radians(90.0);
-        } else if longitude < f64::to_radians(-90.0) {
-            longitude = f64::to_radians(-90.0);
-        }
-        false
+        latitude: f64::asin(z / r),
+        longitude: f64::atan2(*y, *x),
     }
 }
 
@@ -296,18 +152,18 @@ pub struct OrthogonalProjection {
 
 impl OrthogonalProjection {
     pub fn new(x_axis: Coord3D, y_axis: Coord3D) -> OrthogonalProjection {
-        let x_axis = normalize(&x_axis);
-        let y_axis = normalize(&y_axis);
-        OrthogonalProjection {
-            x_axis: x_axis,
-            y_axis: y_axis,
-            z_axis: cross_product(&x_axis, &y_axis)
-        }
+        //let x_axis = normalize(&x_axis);
+        //let y_axis = normalize(&y_axis);
         //OrthogonalProjection {
-        //    x_axis: Coord3D { x: 0.0, y: 1.0, z: 0.0 },
-        //    y_axis: Coord3D { x: 0.0, y: 0.0, z: 1.0 },
-        //    z_axis: Coord3D { x: 1.0, y: 0.0, z: 0.0 },
+        //    x_axis: x_axis,
+        //    y_axis: y_axis,
+        //    z_axis: cross_product(&x_axis, &y_axis)
         //}
+        OrthogonalProjection {
+            x_axis: Coord3D { x: 0.0, y: 1.0, z: 0.0 },
+            y_axis: Coord3D { x: 0.0, y: 0.0, z: 1.0 },
+            z_axis: Coord3D { x: 1.0, y: 0.0, z: 0.0 },
+        }
     }
 
     pub fn new_from_normal(normal: Coord3D) -> OrthogonalProjection {
@@ -368,12 +224,28 @@ impl OrthogonalProjection {
         // the Y component is cos*hyp = ajd/hyp*hyp = adj. and the X component is
         // sin*hyp = opp/hyp*hyp = opp.
         // To get the value of hyp, use cos(yaw).
-        let normal = Coord3D {
+        //let normal = Coord3D {
+        //    x: f64::cos(longitude) * f64::cos(latitude),
+        //    y: f64::sin(longitude) * f64::cos(latitude),
+        //    z: f64::sin(latitude)
+        //};
+        //OrthogonalProjection::new_from_normal(normal)
+        let x_axis = Coord3D {
             x: f64::cos(longitude) * f64::cos(latitude),
             y: f64::sin(longitude) * f64::cos(latitude),
             z: f64::sin(latitude)
         };
-        OrthogonalProjection::new_from_normal(normal)
+        let y_axis = Coord3D {
+            x: f64::cos(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
+            y: f64::sin(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
+            z: f64::sin(latitude)
+        };
+        let z_axis = cross_product(&x_axis, &y_axis);
+        OrthogonalProjection {
+            x_axis: x_axis,
+            y_axis: y_axis,
+            z_axis: z_axis
+        }
     }
 
     fn project_single_with_depth(&self, input: Coord3D) -> Coord3D {
@@ -394,8 +266,8 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
     let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
     let lon = f64::signum(inside_rev.longitude) * f64::to_radians(90.0);
     let edge_rev = CoordGeo {
-        longitude: lon,
-        latitude: - inside_rev.latitude + lat_slope * (lon - inside_rev.longitude)
+        longitude: -lon,
+        latitude: -(inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
     };
     //console_log!("inside: {},  outside: {}, edge: {}", inside_rev, outside_rev, edge_rev);
     let sphere_proj = SphereProjection;
@@ -417,30 +289,6 @@ impl Projection<Coord3D> for OrthogonalProjection {
 
     fn project(&self, input: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=Coord2D> {
         OrthogonalProjectionIterator::new(self, input)
-        //let mut last = Option::<Coord3D>::None;
-        //input.filter_map(move |coord| {
-        //    let projected = self.project_single_with_depth(coord); 
-        //    if projected.z >= 0.0 {
-        //        last = Option::Some(projected);
-        //        Option::Some(Coord2D { x: projected.x, y: projected.y })
-        //    } else {
-        //        if let Some(last_coord) = last {
-        //            // The previous coordinate was visible, but this one is invisible (back side of the globe);
-        //            // this means there is some point between the last point and this one that is at the edge
-        //            // of the globe. We should clamp this coordinate to that last visible position.
-        //            let edge = get_viewport_intersection_point(last_coord, projected);
-        //            last = Option::None;
-        //            let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
-        //            let uy = Coord3D { x: 0.0, y: 0.0, z: 1.0 };  // FIXME why -1 Z axis??
-        //            Option::Some(Coord2D {
-        //                x: dot_product(&edge, &ux),
-        //                y: dot_product(&edge, &uy)
-        //            })
-        //        } else {
-        //            Option::None
-        //        }
-        //    }
-        //})
     }
 }
 
@@ -454,7 +302,6 @@ where InputIter: Iterator<Item=Coord3D> {
 impl<'a, InputIter> OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     fn new(proj: &'a OrthogonalProjection, mut iter: InputIter) -> Self {
-        let first = iter.next();
         Self {
             proj: proj,
             iter: iter,
@@ -475,60 +322,66 @@ impl<'a, InputIter> Iterator for OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     type Item = Coord2D;
     fn next(&mut self) -> Option<Coord2D> {
-        let mut maybe_cur_projected = if self.next.is_some() { self.next } else { self.iter.next().map(|x| { self.proj.project_single_with_depth(x) }) };
+        let mut maybe_cur_projected = 
+            if self.next.is_some() { self.next } 
+            else { self.iter.next().map(|x| { self.proj.project_single_with_depth(x) }) };
         self.next = Option::None;
-        loop {
-            let maybe_next_projected = self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
-            if let Some(cur) = maybe_cur_projected {
-                if cur.z < 0.0 {
+        let mut maybe_next_projected = 
+            self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
+        if let Some(cur) = maybe_cur_projected {
+            if cur.x < 0.0 {
+                let maybe_next_projected = loop {
                     // current is invisible; we need to advance to a point
                     // where "next" is visible
                     if let Some(next) = maybe_next_projected {
-                        if next.z < 0.0 {
-                            // Both current and next are invisible; iterate to
-                            // the next point. If it is visible, we will clamp
-                            // "next" to the point after "next", if not we will
-                            // keep iterating, etc.
-                            maybe_cur_projected = maybe_next_projected;
-                            continue
+                        if next.x >= 0.0 {
+                            // next visible point found
+                            break maybe_next_projected;
                         }
-                        // Current is invisible but next is visible. Clamp 
-                        // current to the last visible point on the line towards
-                        // "next", return it, and enqueue "next" to be used as
-                        // the next point (since we have already taken it out
-                        // of the input iterator).
-                        self.next = maybe_next_projected;
-                        let cur_clamped = get_viewport_intersection_point(next, cur);
-                        break Option::Some(Coord2D{ x: cur_clamped.x, y: cur_clamped.y });
+                        maybe_cur_projected = maybe_next_projected;
+                        maybe_next_projected = 
+                            self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
+                        continue
                     } else {
-                        // Current is invisible and we have no next point to
-                        // draw a line to; yield no more points. Note that we
-                        // will have drawn the last visible point when we
-                        // clamped "next" and enqueued it.
                         break Option::None
                     }
+                };
+                if let Some(next) = maybe_next_projected {
+                    // Current is invisible but next is visible. Clamp 
+                    // current to the last visible point on the line towards
+                    // "next", return it, and enqueue "next" to be used as
+                    // the next point (since we have already taken it out
+                    // of the input iterator).
+                    self.next = maybe_next_projected;
+                    let cur_clamped = get_viewport_intersection_point(next, cur);
+                    return Option::Some(Coord2D{ x: cur_clamped.y, y: cur_clamped.z });
                 } else {
-                    // current is visible; we can project and return it as-is,
-                    // but we also need to take care of "next". If it is outside
-                    // the visible range, we need to clamp it to the 
-                    // intersection between current and next and enqueue it.
-                    if let Some(next) = maybe_next_projected {
-                        if next.z < 0.0 {
-                            // next is invisible; clamp it and enqueue the
-                            // clamped version
-                            let next_clamped = get_viewport_intersection_point(cur, next);
-                            self.next = Option::Some(next_clamped);
-                        } else {
-                            // next is also visible; just enqueue it as-is
-                            self.next = maybe_next_projected;
-                        }
-                    }
-                    break Option::Some(Coord2D { x: cur.x, y: cur.y })
+                    // Current is invisible and we have no next point to
+                    // draw a line to; yield no more points. Note that we
+                    // will have drawn the last visible point when we
+                    // clamped "next" and enqueued it.
+                    return Option::None
                 }
             } else {
-                break Option::None
+                // current is visible; we can project and return it as-is,
+                // but we also need to take care of "next". If it is outside
+                // the visible range, we need to clamp it to the 
+                // intersection between current and next and enqueue it.
+                if let Some(next) = maybe_next_projected {
+                    if next.x < 0.0 {
+                        // next is invisible; clamp it and enqueue the
+                        // clamped version
+                        let next_clamped = get_viewport_intersection_point(cur, next);
+                        self.next = Option::Some(next_clamped);
+                    } else {
+                        // next is also visible; just enqueue it as-is
+                        self.next = maybe_next_projected;
+                    }
+                }
+                return Option::Some(Coord2D { x: cur.y, y: cur.z })
             }
         }
+        return Option::None
     }
 }
 

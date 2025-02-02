@@ -209,31 +209,40 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
 /// Helper function that takes an iterator of a line and projects its
 /// coordinates
 fn project_lines<'a>(
-    lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a>, 
+    lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a, 
     proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
-    proj_2d: &'a impl Projection<Coord3D, To=Coord2D>,
+    proj_2d: &'a OrthogonalProjection,
 ) 
-    -> impl Iterator<Item=impl Iterator<Item=Coord2D> + 'a>
+    -> impl Iterator<Item=DrawOp<Coord2D>> + 'a
 {
-    //let scale_fac = f64::min(self.width*0.8/2.0, self.height*0.8/2.0);
-    //let scale = Scale2D { x: scale_fac, y: scale_fac };
-    //let translate = Translate2D { x: self.width/2.0, y: self.height/2.0 };
+    // TODO: move below transforms into World struct
     let scale_fac = f64::min(600.0*0.8/2.0, 400.0*0.8/2.0);
+    let scale = Scale2D { x: scale_fac, y: scale_fac };
+    let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
 
     lines.filter_map(move |line| {
-        let mut projected = proj_2d.project(proj_3d.project(line));
-        let first_point = projected.next();
+        let mut projected = line.map(move |point| {
+            proj_2d.project(&proj_3d.project(&point))
+        });
+        let mut draw_op_gen = 
+            OrthogonalProjectionIterator::new(&proj_2d, projected);
+        let first_point = draw_op_gen.next();
         if let Some(first_point) = first_point {
-            Option::Some(projected.chain(std::iter::once(first_point)).map(move |coord| {
-                // TODO: move below transforms into World struct
-                let scale = Scale2D { x: scale_fac, y: scale_fac };
-                let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
-                translate.transform(&scale.transform(&coord))
-            }))
+            let ret = 
+                draw_op_gen
+                .chain(std::iter::once(first_point))
+                .map(move |mut op| {
+                    let maybe_coord = op.get_coord();
+                    if let Some(coord) = maybe_coord {
+                        op.set_coord(translate.transform(&scale.transform(coord)));
+                    }
+                    op
+                });
+            Option::Some(ret)
         } else {
             Option::None
         }
-    })
+    }).flatten()
 }
 
 /// Create an iterator of drawing operations for each frame. The idea is that
@@ -261,20 +270,30 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
     let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d);
     let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d);
 
-    Some(std::iter::once(DrawOp::BeginPath)
-        .chain(lat_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
-        .chain(lon_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
-        .chain(country_outlines
-            .map(coord_iter_into_draw_ops)
-            .map(move |ops| { 
-                ops
-                    .chain(std::iter::once(DrawOp::Stroke(context.country_outlines_stroke_style.to_string())))
-                    .chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string()))) })
-            .flatten())
-        .chain(debug_points.map(|l| { l.map(|p| {
-            DrawOp::BigRedCircle(p)
-        }) }).flatten())
+    Some(
+        std::iter::once(DrawOp::BeginPath)
+            .chain(lat_lines)
+            .chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string())))
+            //.chain(lon_lines)
+            //.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string())))
+            //.chain(country_outlines)
+            //.chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string())))
+            //.chain(debug_points)
     )
+    //Some(std::iter::once(DrawOp::BeginPath)
+    //    .chain(lat_lines.map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
+    //    .chain(lon_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
+    //    .chain(country_outlines
+    //        .map(coord_iter_into_draw_ops)
+    //        .map(move |ops| { 
+    //            ops
+    //                .chain(std::iter::once(DrawOp::Stroke(context.country_outlines_stroke_style.to_string())))
+    //                .chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string()))) })
+    //        .flatten())
+    //    .chain(debug_points.map(|l| { l.map(|p| {
+    //        DrawOp::BigRedCircle(p)
+    //    }) }).flatten())
+    // )
 
 }
 

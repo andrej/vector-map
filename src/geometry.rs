@@ -2,6 +2,7 @@ use std::fmt;
 use std::ops;
 
 use crate::console_log;
+use crate::DrawOp;
 
 // --------------------------------------------------------------------------
 // CoordGeo
@@ -114,24 +115,22 @@ impl fmt::Display for Coord2D {
 
 pub trait Projection<From> {
     type To;
-    fn project(&self, input: impl Iterator<Item=From>) -> impl Iterator<Item=Self::To>;
+    fn project(&self, input: &From) -> Self::To;
 }
 
 pub struct SphereProjection;
 
 impl Projection<CoordGeo> for SphereProjection {
     type To = Coord3D;
-    fn project(&self, input: impl Iterator<Item=CoordGeo>) -> impl Iterator<Item=Coord3D> {
+    fn project(&self, &CoordGeo { latitude: lat, longitude: lon}: &CoordGeo) -> Coord3D {
         let r = 1.0;
         // Positive longitudes are EAST of meridian
         // Positive latitudes are NORTH of the equator
-        input.map(move |CoordGeo { latitude: lat, longitude: lon } | {
-            Coord3D { 
-                x: r * f64::cos(-lon) * f64::cos(-lat),
-                y: r * f64::sin(-lon) * f64::cos(-lat),
-                z: r * f64::sin(-lat) 
-            }
-        })
+        Coord3D { 
+            x: r * f64::cos(-lon) * f64::cos(-lat),
+            y: r * f64::sin(-lon) * f64::cos(-lat),
+            z: r * f64::sin(-lat) 
+        }
     }
 }
 
@@ -206,30 +205,6 @@ impl OrthogonalProjection {
     
 
     pub fn new_from_angles(latitude: f64, longitude: f64) -> OrthogonalProjection {
-        // First, draw a unit length vector going into space from the origin, at
-        // an angle of `pitch` measured from the XY plane. To get the Z component,
-        // consider the vector the hypothenuse of a triangle, with the Z axis being
-        // the adjacent side of a 90-pitch angle. cos=adj./hyp., so cos(180-pitch)
-        // is the Z height. Since cos(90-pitch) = sin(pitch) we use that.
-        // Now, to figure out the X and Y components, forget about the first 
-        // triangle. Instead, draw a triangle where the hypothenuse lies on the 
-        // XY plane, the unit vector is the adjacent side, and the opposite side
-        // is prependicular to the unit vector, i.e. a right angle floating in
-        // space, pointing down at the XY plane.
-        // The length of the hyptohenuse will not be one (unless pitch is zero).
-        // Draw two more triangles using the hypthenuse of the previous triangle as
-        // its hypothenuse, and the adjacent sides being the X and Y axes, 
-        // respectively, for each triangle.
-        // The yaw angle is the angle between Y axis and the hypothenuse, so
-        // the Y component is cos*hyp = ajd/hyp*hyp = adj. and the X component is
-        // sin*hyp = opp/hyp*hyp = opp.
-        // To get the value of hyp, use cos(yaw).
-        //let normal = Coord3D {
-        //    x: f64::cos(longitude) * f64::cos(latitude),
-        //    y: f64::sin(longitude) * f64::cos(latitude),
-        //    z: f64::sin(latitude)
-        //};
-        //OrthogonalProjection::new_from_normal(normal)
         let x_axis = Coord3D {
             x: f64::cos(longitude) * f64::cos(latitude),
             y: f64::sin(longitude) * f64::cos(latitude),
@@ -247,8 +222,13 @@ impl OrthogonalProjection {
             z_axis: z_axis
         }
     }
+}
 
-    fn project_single_with_depth(&self, input: Coord3D) -> Coord3D {
+
+impl Projection<Coord3D> for OrthogonalProjection {
+    type To = Coord3D;
+
+    fn project(&self, input: &Coord3D) -> Coord3D {
         Coord3D { 
             x: dot_product(&input, &self.x_axis), 
             y: dot_product(&input, &self.y_axis),
@@ -271,28 +251,11 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
     };
     //console_log!("inside: {},  outside: {}, edge: {}", inside_rev, outside_rev, edge_rev);
     let sphere_proj = SphereProjection;
-    let edge = sphere_proj.project(std::iter::once(edge_rev)).next().unwrap();
+    let edge = sphere_proj.project(&edge_rev);
     edge
 }
 
-fn coord3d_to_coord2d_yz_plane(input: Coord3D) -> Coord2D {
-    let ux = Coord3D { x: 0.0, y: 1.0, z: 0.0 };
-    let uy = Coord3D { x: 0.0, y: 0.0, z: 1.0 };  // FIXME why -1 Z axis??
-    Coord2D {
-        x: dot_product(&input, &ux),
-        y: dot_product(&input, &uy)
-    }
-}
-
-impl Projection<Coord3D> for OrthogonalProjection {
-    type To = Coord2D;
-
-    fn project(&self, input: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=Coord2D> {
-        OrthogonalProjectionIterator::new(self, input)
-    }
-}
-
-struct OrthogonalProjectionIterator<'a, InputIter>
+pub struct OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     proj: &'a OrthogonalProjection,
     iter: InputIter,
@@ -301,7 +264,7 @@ where InputIter: Iterator<Item=Coord3D> {
 
 impl<'a, InputIter> OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
-    fn new(proj: &'a OrthogonalProjection, mut iter: InputIter) -> Self {
+    pub fn new(proj: &'a OrthogonalProjection, mut iter: InputIter) -> Self {
         Self {
             proj: proj,
             iter: iter,
@@ -310,24 +273,14 @@ where InputIter: Iterator<Item=Coord3D> {
     }
 }
 
-/*
-last visible    this visible    - project this
-last invisible  this visible    - project clamped last; queue this next
-last visible    this invisible  - project clamped this
-last invisible  this invisibile - move to next coord
-*/
-
-
 impl<'a, InputIter> Iterator for OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
-    type Item = Coord2D;
-    fn next(&mut self) -> Option<Coord2D> {
-        let mut maybe_cur_projected = 
-            if self.next.is_some() { self.next } 
-            else { self.iter.next().map(|x| { self.proj.project_single_with_depth(x) }) };
+    type Item = DrawOp<Coord2D>;
+    fn next(&mut self) -> Option<DrawOp<Coord2D>> {
+        let mut maybe_cur_projected = if self.next.is_some() { self.next } else { self.iter.next() };
         self.next = Option::None;
         let mut maybe_next_projected = 
-            self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
+            self.iter.next().map(|x| { self.proj.project(&x) });
         if let Some(cur) = maybe_cur_projected {
             if cur.x < 0.0 {
                 let maybe_next_projected = loop {
@@ -339,8 +292,7 @@ where InputIter: Iterator<Item=Coord3D> {
                             break maybe_next_projected;
                         }
                         maybe_cur_projected = maybe_next_projected;
-                        maybe_next_projected = 
-                            self.iter.next().map(|x| { self.proj.project_single_with_depth(x) });
+                        maybe_next_projected = self.iter.next();
                         continue
                     } else {
                         break Option::None
@@ -354,7 +306,10 @@ where InputIter: Iterator<Item=Coord3D> {
                     // of the input iterator).
                     self.next = maybe_next_projected;
                     let cur_clamped = get_viewport_intersection_point(next, cur);
-                    return Option::Some(Coord2D{ x: cur_clamped.y, y: cur_clamped.z });
+                    // TODO: Draw arc here instead of "move to"
+                    return Option::Some(
+                        DrawOp::MoveTo(Coord2D{ x: cur_clamped.y, y: cur_clamped.z })
+                    );
                 } else {
                     // Current is invisible and we have no next point to
                     // draw a line to; yield no more points. Note that we
@@ -378,7 +333,9 @@ where InputIter: Iterator<Item=Coord3D> {
                         self.next = maybe_next_projected;
                     }
                 }
-                return Option::Some(Coord2D { x: cur.y, y: cur.z })
+                return Option::Some(
+                    DrawOp::LineTo(Coord2D { x: cur.y, y: cur.z })
+                )
             }
         }
         return Option::None

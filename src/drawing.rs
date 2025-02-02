@@ -19,6 +19,25 @@ pub enum DrawOp<CoordT> {
     BigRedCircle(CoordT),
 }
 
+impl<CoordT> DrawOp<CoordT> {
+    pub fn get_coord(&self) -> Option<&CoordT> {
+        match self {
+            DrawOp::MoveTo(coord) => Option::Some(coord),
+            DrawOp::LineTo(coord) => Option::Some(coord),
+            DrawOp::BigRedCircle(coord) => Option::Some(coord),
+            _ => Option::None
+        }
+    }
+    pub fn set_coord(&mut self, coord: CoordT) {
+        match self {
+            DrawOp::MoveTo(_) => *self = DrawOp::MoveTo(coord),
+            DrawOp::LineTo(_) => *self = DrawOp::LineTo(coord),
+            DrawOp::BigRedCircle(_) => *self = DrawOp::BigRedCircle(coord),
+            _ => ()
+        }
+    }
+}
+
 impl DrawOp<Coord2D> {
     pub fn draw(&self, context: &web_sys::CanvasRenderingContext2d) {
         match self {

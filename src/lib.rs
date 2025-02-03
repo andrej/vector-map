@@ -73,8 +73,8 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let yaw = f64::to_radians(0.0);
-        let pitch = f64::to_radians(0.0);
+        let yaw = f64::to_radians(180.0);
+        let pitch = f64::to_radians(3.0);
         Self {
             yaw: yaw,
             pitch: pitch,
@@ -135,7 +135,7 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
     let lat_lines = 
         (0..n_lines).map(move |lat_i| { 
             let lat: f64 = -90.0 + (lat_i as f64) / (n_lines as f64) * 180.0;
-            (0..(resolution+1)).map(move |lon_i| { 
+            (0..=resolution).map(move |lon_i| { 
                 let lon: f64 = -180.0 + (lon_i as f64) / (resolution as f64) * 360.0;
                 //let lon: f64 = -90.0 + (lon_i as f64) / (resolution as f64) * 180.0;
                 CoordGeo { 
@@ -149,7 +149,7 @@ fn gen_lat_lon_lines(n_lines: i32, resolution: i32) -> (impl Iterator<Item=impl 
     let lon_lines =
         (0..n_lines).map(move |lon_i| { 
             let lon: f64 = -90.0 + (lon_i as f64) / (n_lines as f64) * 180.0;
-            (0..(resolution+1)).map(move |lat_i| { 
+            (0..=resolution).map(move |lat_i| { 
                 let lat: f64 = -180.0 + (lat_i as f64) / (resolution as f64) * 360.0;
                 CoordGeo { 
                     latitude: f64::to_radians(lat), 
@@ -212,6 +212,8 @@ fn project_lines<'a>(
     lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a, 
     proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
     proj_2d: &'a OrthogonalProjection,
+    start_op: DrawOp<Coord2D>,
+    end_op: DrawOp<Coord2D>
 ) 
     -> impl Iterator<Item=DrawOp<Coord2D>> + 'a
 {
@@ -227,10 +229,14 @@ fn project_lines<'a>(
         let mut draw_op_gen = 
             OrthogonalProjectionIterator::new(&proj_2d, projected);
         let first_point = draw_op_gen.next();
-        if let Some(first_point) = first_point {
+        if let Some(mut first_point) = first_point {
+            let first_coord = first_point.get_coord();
+            if let Some(&first_coord) = first_coord {
+                first_point = DrawOp::MoveTo(first_coord);
+            }
             let ret = 
-                draw_op_gen
-                .chain(std::iter::once(first_point))
+                std::iter::once(first_point)
+                .chain(draw_op_gen)
                 .map(move |mut op| {
                     let maybe_coord = op.get_coord();
                     if let Some(coord) = maybe_coord {
@@ -242,7 +248,13 @@ fn project_lines<'a>(
         } else {
             Option::None
         }
-    }).flatten()
+    })
+    .map(move |line_ops| {
+        std::iter::once(start_op.clone())
+            .chain(line_ops)
+            .chain(std::iter::once(end_op.clone()))
+    })
+    .flatten()
 }
 
 /// Create an iterator of drawing operations for each frame. The idea is that
@@ -263,22 +275,19 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
     let country_outlines = country_outlines;
 
     // Debug points
-    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d);
+    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
 
     // Project all lines
-    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d);
-    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d);
-    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d);
+    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
+    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
+    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()));
 
     Some(
         std::iter::once(DrawOp::BeginPath)
             .chain(lat_lines)
-            .chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string())))
-            //.chain(lon_lines)
-            //.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string())))
-            //.chain(country_outlines)
-            //.chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string())))
-            //.chain(debug_points)
+            .chain(lon_lines)
+            .chain(country_outlines)
+            .chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
     )
     //Some(std::iter::once(DrawOp::BeginPath)
     //    .chain(lat_lines.map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())

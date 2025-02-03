@@ -255,11 +255,17 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
     edge
 }
 
+enum OrthogonalProjectionIteratorState {
+    HaveNext(Coord3D),
+    HaveClampedNext(Coord3D),
+    Normal,
+}
+
 pub struct OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     proj: &'a OrthogonalProjection,
     iter: InputIter,
-    next: Option<Coord3D>
+    state: OrthogonalProjectionIteratorState,
 }
 
 impl<'a, InputIter> OrthogonalProjectionIterator<'a, InputIter>
@@ -268,7 +274,7 @@ where InputIter: Iterator<Item=Coord3D> {
         Self {
             proj: proj,
             iter: iter,
-            next: Option::None
+            state: OrthogonalProjectionIteratorState::Normal,
         }
     }
 }
@@ -277,36 +283,37 @@ impl<'a, InputIter> Iterator for OrthogonalProjectionIterator<'a, InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     type Item = DrawOp<Coord2D>;
     fn next(&mut self) -> Option<DrawOp<Coord2D>> {
-        let mut maybe_cur_projected = if self.next.is_some() { self.next } else { self.iter.next() };
-        self.next = Option::None;
-        let mut maybe_next_projected = 
-            self.iter.next().map(|x| { self.proj.project(&x) });
-        if let Some(cur) = maybe_cur_projected {
-            if cur.x < 0.0 {
-                let maybe_next_projected = loop {
+        let (mut maybe_cur, cur_is_clamped) = 
+            if let OrthogonalProjectionIteratorState::HaveNext(next) = self.state { (Option::Some(next), false) } 
+            else if let OrthogonalProjectionIteratorState::HaveClampedNext(next ) = self.state { (Option::Some(next), true) } 
+            else { (self.iter.next(), false) };
+        self.state = OrthogonalProjectionIteratorState::Normal; // May be updated below
+        let mut maybe_next = self.iter.next();
+        if let Some(cur) = maybe_cur {
+            if cur.x <= 0.0 {
+                let maybe_next = loop {
                     // current is invisible; we need to advance to a point
                     // where "next" is visible
-                    if let Some(next) = maybe_next_projected {
-                        if next.x >= 0.0 {
+                    if let Some(next) = maybe_next {
+                        if next.x > 0.0 {
                             // next visible point found
-                            break maybe_next_projected;
+                            break maybe_next;
                         }
-                        maybe_cur_projected = maybe_next_projected;
-                        maybe_next_projected = self.iter.next();
+                        maybe_cur = maybe_next;
+                        maybe_next = self.iter.next();
                         continue
                     } else {
                         break Option::None
                     }
                 };
-                if let Some(next) = maybe_next_projected {
+                if let Some(next) = maybe_next {
                     // Current is invisible but next is visible. Clamp 
                     // current to the last visible point on the line towards
                     // "next", return it, and enqueue "next" to be used as
                     // the next point (since we have already taken it out
                     // of the input iterator).
-                    self.next = maybe_next_projected;
+                    self.state = OrthogonalProjectionIteratorState::HaveNext(next);
                     let cur_clamped = get_viewport_intersection_point(next, cur);
-                    // TODO: Draw arc here instead of "move to"
                     return Option::Some(
                         DrawOp::MoveTo(Coord2D{ x: cur_clamped.y, y: cur_clamped.z })
                     );
@@ -322,20 +329,18 @@ where InputIter: Iterator<Item=Coord3D> {
                 // but we also need to take care of "next". If it is outside
                 // the visible range, we need to clamp it to the 
                 // intersection between current and next and enqueue it.
-                if let Some(next) = maybe_next_projected {
-                    if next.x < 0.0 {
+                if let Some(next) = maybe_next {
+                    if next.x <= 0.0 && !cur_is_clamped {
                         // next is invisible; clamp it and enqueue the
                         // clamped version
                         let next_clamped = get_viewport_intersection_point(cur, next);
-                        self.next = Option::Some(next_clamped);
+                        self.state = OrthogonalProjectionIteratorState::HaveClampedNext(next_clamped);
                     } else {
                         // next is also visible; just enqueue it as-is
-                        self.next = maybe_next_projected;
+                        self.state = OrthogonalProjectionIteratorState::HaveNext(next);
                     }
                 }
-                return Option::Some(
-                    DrawOp::LineTo(Coord2D { x: cur.y, y: cur.z })
-                )
+                return Option::Some(DrawOp::LineTo(Coord2D { x: cur.y, y: cur.z }))
             }
         }
         return Option::None

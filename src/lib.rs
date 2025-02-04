@@ -227,7 +227,7 @@ fn project_lines<'a>(
             proj_2d.project(&proj_3d.project(&point))
         });
         let mut draw_op_gen = 
-            OrthogonalProjectionIterator::new(&proj_2d, projected);
+            ClampedArcIterator::new(ClampedIterator::new(projected));
         let first_point = draw_op_gen.next();
         if let Some(mut first_point) = first_point {
             let first_coord = first_point.get_coord();

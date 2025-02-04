@@ -255,95 +255,156 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
     edge
 }
 
-enum OrthogonalProjectionIteratorState {
-    HaveNext(Coord3D),
-    HaveClampedNext(Coord3D),
-    Normal,
+#[derive(Clone)]
+pub enum ClampedIteratorPoint {
+    /// This point is visible, and the points before and after it (if any) are
+    /// also visible.
+    Visible(Coord3D), 
+    /// This point is the last visible point before the shape leaves the
+    /// viewport. It is likely the result of clamping the intersection of a
+    /// visible point in the input iterator and its following invisible point.
+    LastVisible(Coord3D),
+    /// This point is the first visible point after previous points of the
+    /// shape were outside the viewport.
+    FirstVisible(Coord3D)
+    // Note that if we have a viewport that is alrger than zero (which we 
+    // assume) we cannot have a point that is both FirstVisible *and* 
+    // LastVisible, as those points would be clamped to the respective edges of
+    // the viewport. We also assume that we don't have lines that go 
+    // from point A to point B to point A, where A is outside of the viewport
+    // and B is inside, and we assume no point lies exactly on the boundary of
+    // the viewport.
 }
 
-pub struct OrthogonalProjectionIterator<'a, InputIter>
-where InputIter: Iterator<Item=Coord3D> {
-    proj: &'a OrthogonalProjection,
-    iter: InputIter,
-    state: OrthogonalProjectionIteratorState,
-}
-
-impl<'a, InputIter> OrthogonalProjectionIterator<'a, InputIter>
-where InputIter: Iterator<Item=Coord3D> {
-    pub fn new(proj: &'a OrthogonalProjection, mut iter: InputIter) -> Self {
-        Self {
-            proj: proj,
-            iter: iter,
-            state: OrthogonalProjectionIteratorState::Normal,
+impl ClampedIteratorPoint {
+    fn get_coord(&self) -> &Coord3D {
+        match self {
+            Self::Visible(x) | Self::LastVisible(x) | Self::FirstVisible(x) => { x }
         }
     }
 }
 
-impl<'a, InputIter> Iterator for OrthogonalProjectionIterator<'a, InputIter>
+pub struct ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
-    type Item = DrawOp<Coord2D>;
-    fn next(&mut self) -> Option<DrawOp<Coord2D>> {
-        let (mut maybe_cur, cur_is_clamped) = 
-            if let OrthogonalProjectionIteratorState::HaveNext(next) = self.state { (Option::Some(next), false) } 
-            else if let OrthogonalProjectionIteratorState::HaveClampedNext(next ) = self.state { (Option::Some(next), true) } 
-            else { (self.iter.next(), false) };
-        self.state = OrthogonalProjectionIteratorState::Normal; // May be updated below
-        let mut maybe_next = self.iter.next();
-        if let Some(cur) = maybe_cur {
-            if cur.x <= 0.0 {
-                let maybe_next = loop {
-                    // current is invisible; we need to advance to a point
-                    // where "next" is visible
-                    if let Some(next) = maybe_next {
-                        if next.x > 0.0 {
-                            // next visible point found
-                            break maybe_next;
-                        }
-                        maybe_cur = maybe_next;
-                        maybe_next = self.iter.next();
-                        continue
-                    } else {
-                        break Option::None
-                    }
-                };
-                if let Some(next) = maybe_next {
-                    // Current is invisible but next is visible. Clamp 
-                    // current to the last visible point on the line towards
-                    // "next", return it, and enqueue "next" to be used as
-                    // the next point (since we have already taken it out
-                    // of the input iterator).
-                    self.state = OrthogonalProjectionIteratorState::HaveNext(next);
-                    let cur_clamped = get_viewport_intersection_point(next, cur);
-                    return Option::Some(
-                        DrawOp::MoveTo(Coord2D{ x: cur_clamped.y, y: cur_clamped.z })
-                    );
+    iter: InputIter,
+    next: Option<ClampedIteratorPoint>,
+}
+
+impl<InputIter> ClampedIterator<InputIter>
+where InputIter: Iterator<Item=Coord3D> {
+    pub fn new(mut iter: InputIter) -> Self {
+        Self {
+            iter: iter,
+            next: Option::None 
+        }
+    }
+
+    fn next_visible(&mut self) -> (Option<Coord3D>, Option<Coord3D>) {
+        let mut maybe_before_current = Option::None;
+        let mut maybe_current = self.iter.next();
+        while maybe_current.is_some() && maybe_current.unwrap().x < 0.0 {
+            maybe_before_current = maybe_current;
+            maybe_current = self.iter.next();
+        }
+        (maybe_before_current, maybe_current)
+    }
+}
+
+impl<InputIter> Iterator for ClampedIterator<InputIter>
+where InputIter: Iterator<Item=Coord3D> {
+    type Item = ClampedIteratorPoint;
+    fn next(&mut self) -> Option<ClampedIteratorPoint> {
+        use ClampedIteratorPoint::*;
+        let current = match self.next.clone() {
+            Some(LastVisible(p)) => {
+                // return LastVisibles immediately; we start fresh after this
+                self.next = None;
+                return Some(LastVisible(p))
+            },
+            Some(Visible(p)) | Some(FirstVisible(p)) => {
+                self.next = None;
+                p
+            },
+            None => self.iter.next()?
+        };
+        
+        if current.x >= 0.0 {
+            // current is visible
+            let maybe_next = self.iter.next();
+            if let Some(next) = maybe_next { 
+                if next.x < 0.0 {
+                    // next is invisible; clamp and enqueue it as LastVisible
+                    let next_clamped = get_viewport_intersection_point(current, next);
+                    self.next = Some(LastVisible(next_clamped));
                 } else {
-                    // Current is invisible and we have no next point to
-                    // draw a line to; yield no more points. Note that we
-                    // will have drawn the last visible point when we
-                    // clamped "next" and enqueued it.
-                    return Option::None
+                    // next is visible
+                    self.next = Some(Visible(next));
                 }
-            } else {
-                // current is visible; we can project and return it as-is,
-                // but we also need to take care of "next". If it is outside
-                // the visible range, we need to clamp it to the 
-                // intersection between current and next and enqueue it.
-                if let Some(next) = maybe_next {
-                    if next.x <= 0.0 && !cur_is_clamped {
-                        // next is invisible; clamp it and enqueue the
-                        // clamped version
-                        let next_clamped = get_viewport_intersection_point(cur, next);
-                        self.state = OrthogonalProjectionIteratorState::HaveClampedNext(next_clamped);
-                    } else {
-                        // next is also visible; just enqueue it as-is
-                        self.state = OrthogonalProjectionIteratorState::HaveNext(next);
-                    }
+            }
+            // Return this point as regular Visible
+            return Some(Visible(current));
+
+        } else {
+            // current invisible
+            // find next visible
+            let mut maybe_before_next_visible = Option::Some(current);
+            let mut maybe_next_visible = Option::None;
+            while let it@Some(next_visible) = self.iter.next() {
+                if next_visible.x < 0.0 {
+                    // found visible point
+                    maybe_next_visible = it;
                 }
-                return Option::Some(DrawOp::LineTo(Coord2D { x: cur.y, y: cur.z }))
+                maybe_before_next_visible = it;
+            }
+            if let (Some(before_next_visible), Some(next_visible)) = (maybe_before_next_visible, maybe_next_visible) {
+                let next_clamped = get_viewport_intersection_point(next_visible, before_next_visible);
+                self.next = Some(Visible(next_visible));
+                return Some(FirstVisible(next_clamped));
             }
         }
+
+        // input iterator exhausted
         return Option::None
+    }
+}
+
+pub struct ClampedArcIterator<InputIter>
+where InputIter: Iterator<Item=ClampedIteratorPoint> {
+    iter: InputIter,
+    a: Option<ClampedIteratorPoint>,
+    b: Option<ClampedIteratorPoint>
+}
+
+impl<InputIter> ClampedArcIterator<InputIter>
+where InputIter: Iterator<Item=ClampedIteratorPoint> {
+    pub fn new(mut iter: InputIter) -> Self {
+        let next = iter.next();
+        Self {
+            iter: iter,
+            a: Option::None,
+            b: next
+        }
+    }
+}
+
+impl<InputIter> Iterator for ClampedArcIterator<InputIter>
+where InputIter: Iterator<Item=ClampedIteratorPoint> {
+    type Item = DrawOp<Coord2D>;
+    fn next(&mut self) -> Option<DrawOp<Coord2D>> {
+        use ClampedIteratorPoint::*;
+        let a = self.a.clone();
+        let b = self.b.clone();
+        self.a = b.clone();
+        self.b = self.iter.next();
+
+        match (a, b) {
+            (Some(FirstVisible(p)), _) 
+                => Some(DrawOp::MoveTo(Coord2D { x: p.y, y: p.z })),
+            (Some(Visible(p)), _)  |
+            (Some(LastVisible(p)), _) 
+                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: p.z })),
+            (None, _) => None
+        }
     }
 }
 

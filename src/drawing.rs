@@ -10,7 +10,7 @@ use futures::lock::Mutex;
 /// a "LineTo" operation. For such a use case, a vector of coordinates would 
 /// make more sense; this could then be mapped on-the-fly to this enum.
 #[derive(Clone)]
-pub enum DrawOp<CoordT> {
+pub enum DrawOp<'a, CoordT> {
     BeginPath,
     MoveTo(CoordT),
     LineTo(CoordT),
@@ -18,9 +18,11 @@ pub enum DrawOp<CoordT> {
     Stroke(String),
     Fill(String),
     BigRedCircle(CoordT),
+    Arc(CoordT, f64, f64, f64),
+    Text(CoordT, &'a String)
 }
 
-impl<CoordT> DrawOp<CoordT> {
+impl<'a, CoordT> DrawOp<'a, CoordT> {
     pub fn get_coord(&self) -> Option<&CoordT> {
         match self {
             DrawOp::MoveTo(coord) => Option::Some(coord),
@@ -39,7 +41,7 @@ impl<CoordT> DrawOp<CoordT> {
     }
 }
 
-impl DrawOp<Coord2D> {
+impl<'a> DrawOp<'a, Coord2D> {
     pub fn draw(&self, context: &web_sys::CanvasRenderingContext2d) {
         match self {
             DrawOp::BeginPath =>  {
@@ -72,6 +74,12 @@ impl DrawOp<Coord2D> {
                 context.arc(*x, *y, 4.0, 0.0, 2.0*std::f64::consts::PI);
                 context.set_fill_style_str("red");
                 context.fill();
+            },
+            DrawOp::Arc(Coord2D { x, y}, radius, from_angle, to_angle) => {
+                context.arc(*x, *y, *radius, *from_angle, *to_angle);
+            },
+            DrawOp::Text(Coord2D { x, y}, text) => {
+                context.fill_text(text.as_str(), *x, *y);
             }
         }
     }
@@ -81,7 +89,7 @@ impl DrawOp<Coord2D> {
 /// operations. The lifetime annotation is for the references contained within
 /// the DrawOp. We do not create any of the enum values that contain references
 /// in this function, so the lifetime can be anything you need at the call site.
-pub fn coord_iter_into_draw_ops<CoordT>(mut iter: impl Iterator<Item=CoordT>) -> impl Iterator<Item=DrawOp<CoordT>> {
+pub fn coord_iter_into_draw_ops<'a, CoordT>(mut iter: impl Iterator<Item=CoordT> + 'a) -> impl Iterator<Item=DrawOp<'a, CoordT>> {
     std::iter::once(DrawOp::BeginPath)
         .chain(iter.next().map(|x| { DrawOp::MoveTo(x) }).into_iter())
         .chain(iter.map(|x| { DrawOp::LineTo(x) }))

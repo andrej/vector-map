@@ -23,7 +23,7 @@ impl fmt::Display for CoordGeo {
 // --------------------------------------------------------------------------
 // Coord3D
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Coord3D {
     pub x: f64,
     pub y: f64,
@@ -249,13 +249,12 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
         longitude: -lon,
         latitude: -(inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
     };
-    //console_log!("inside: {},  outside: {}, edge: {}", inside_rev, outside_rev, edge_rev);
     let sphere_proj = SphereProjection;
     let edge = sphere_proj.project(&edge_rev);
     edge
 }
 
-#[derive(Clone)]
+#[derive(Clone,Debug)]
 pub enum ClampedIteratorPoint {
     /// This point is visible, and the points before and after it (if any) are
     /// also visible.
@@ -328,11 +327,11 @@ where InputIter: Iterator<Item=Coord3D> {
             None => self.iter.next()?
         };
         
-        if current.x >= 0.0 {
+        if current.x <= 0.0 {
             // current is visible
             let maybe_next = self.iter.next();
             if let Some(next) = maybe_next { 
-                if next.x < 0.0 {
+                if next.x > 0.0 {
                     // next is invisible; clamp and enqueue it as LastVisible
                     let next_clamped = get_viewport_intersection_point(current, next);
                     self.next = Some(LastVisible(next_clamped));
@@ -350,9 +349,10 @@ where InputIter: Iterator<Item=Coord3D> {
             let mut maybe_before_next_visible = Option::Some(current);
             let mut maybe_next_visible = Option::None;
             while let it@Some(next_visible) = self.iter.next() {
-                if next_visible.x < 0.0 {
+                if next_visible.x <= 0.0 {
                     // found visible point
                     maybe_next_visible = it;
+                    break;
                 }
                 maybe_before_next_visible = it;
             }
@@ -368,29 +368,33 @@ where InputIter: Iterator<Item=Coord3D> {
     }
 }
 
-pub struct ClampedArcIterator<InputIter>
-where InputIter: Iterator<Item=ClampedIteratorPoint> {
+pub struct ClampedArcIterator<'a, InputIter>
+where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
     iter: InputIter,
     a: Option<ClampedIteratorPoint>,
-    b: Option<ClampedIteratorPoint>
+    b: Option<ClampedIteratorPoint>,
+    draw_arc: bool,
+    _phantom: std::marker::PhantomData<&'a InputIter>
 }
 
-impl<InputIter> ClampedArcIterator<InputIter>
+impl<'a, InputIter> ClampedArcIterator<'a, InputIter>
 where InputIter: Iterator<Item=ClampedIteratorPoint> {
-    pub fn new(mut iter: InputIter) -> Self {
+    pub fn new(mut iter: InputIter, draw_arc: bool) -> Self {
         let next = iter.next();
         Self {
             iter: iter,
             a: Option::None,
-            b: next
+            b: next,
+            draw_arc: draw_arc,
+            _phantom: std::marker::PhantomData
         }
     }
 }
 
-impl<InputIter> Iterator for ClampedArcIterator<InputIter>
-where InputIter: Iterator<Item=ClampedIteratorPoint> {
-    type Item = DrawOp<Coord2D>;
-    fn next(&mut self) -> Option<DrawOp<Coord2D>> {
+impl<'a, InputIter> Iterator for ClampedArcIterator<'a, InputIter>
+where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
+    type Item = DrawOp<'a, Coord2D>;
+    fn next(&mut self) -> Option<DrawOp<'a, Coord2D>> {
         use ClampedIteratorPoint::*;
         let a = self.a.clone();
         let b = self.b.clone();
@@ -398,12 +402,28 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> {
         self.b = self.iter.next();
 
         match (a, b) {
-            (Some(FirstVisible(p)), _) 
-                => Some(DrawOp::MoveTo(Coord2D { x: p.y, y: p.z })),
-            (Some(Visible(p)), _)  |
-            (Some(LastVisible(p)), _) 
+            (Some(LastVisible(a)), Some(FirstVisible(b))) => {
+                if self.draw_arc {
+                    let (ax, ay) = (a.y, a.z);
+                    let (bx, by) = (b.y, b.z);
+                    use std::f64::consts::PI;
+                    let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
+                    let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
+                    if angle_a < angle_b {
+                        Some(DrawOp::Arc(Coord2D { x: 300.0, y: 200.0 }, 160.0, angle_a, angle_b))
+                    } else {
+                        Some(DrawOp::Arc(Coord2D { x: 300.0, y: 200.0 }, 160.0, angle_b, angle_a))
+                    }
+                } else {
+                    Some(DrawOp::MoveTo(Coord2D { x: b.y, y: b.z }))
+                }
+            },
+            (_, Some(FirstVisible(p))) 
                 => Some(DrawOp::LineTo(Coord2D { x: p.y, y: p.z })),
-            (None, _) => None
+            (_, Some(Visible(p)))  |
+            (_, Some(LastVisible(p))) 
+                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: p.z })),
+            (_, None) => None
         }
     }
 }

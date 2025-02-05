@@ -26,10 +26,21 @@ use drawing::*;
 const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/geoBoundariesCGAZ_ADM0.shp");
 
 // Disable req_animation_frame and update_state loop for debugging
-const ANIMATE: bool = true;
+use std::f64::consts::PI;
+const ANIMATE: bool = false;
 const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
+const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
+    [CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
+     CoordGeo { latitude: 0.3*PI, longitude: 0.0 },
+     CoordGeo { latitude: 0.3*PI, longitude: 0.5*PI },
+     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI },
+     CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
+     ],
+
+];
+const START_LON: f64 = 1.05*PI; //0.2*PI;
 
 enum BounceDirection {
     BounceUp(f64),
@@ -69,11 +80,12 @@ struct World {
     latlon_stroke_style: &'static str,
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
+    latlon_str: String
 }
 
 impl World {
     fn new() -> Self {
-        let yaw = f64::to_radians(180.0);
+        let yaw = START_LON;
         let pitch = f64::to_radians(3.0);
         Self {
             yaw: yaw,
@@ -84,7 +96,8 @@ impl World {
             latlon_stroke_style: "#ccc",
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
-            country_outlines: gen_country_outlines()
+            country_outlines: gen_country_outlines(),
+            latlon_str: String::new()
         }
     }
 }
@@ -116,6 +129,8 @@ impl CanvasRenderLoopState for World
         //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
         self.proj_3d = SphereProjection;
         self.proj_2d = OrthogonalProjection::new_from_angles(self.pitch, self.yaw);
+
+        self.latlon_str = String::from(format!("lat: {:3.3} lon: {:3.3}", f64::to_degrees(self.pitch), f64::to_degrees(self.yaw)));
     }
 
     fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
@@ -167,7 +182,7 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
     let mut boundaries_shp_curs = std::io::Cursor::new(&BOUNDARIES_SHP[..]);
     let mut shp = shapefile::ShapeReader::new(boundaries_shp_curs).expect("unable to read shapefile");
 
-    let res = f64::to_radians(5.0); // degrees latitude/longitude difference to be included TODO: proper shape simplification
+    let res = f64::to_radians(1.0); // degrees latitude/longitude difference to be included TODO: proper shape simplification
 
     for maybe_shp in shp.iter_shapes() {
         if let Ok(shp) = maybe_shp {
@@ -212,10 +227,11 @@ fn project_lines<'a>(
     lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a, 
     proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
     proj_2d: &'a OrthogonalProjection,
-    start_op: DrawOp<Coord2D>,
-    end_op: DrawOp<Coord2D>
+    start_op: DrawOp<'a, Coord2D>,
+    end_op: DrawOp<'a, Coord2D>,
+    draw_arc: bool
 ) 
-    -> impl Iterator<Item=DrawOp<Coord2D>> + 'a
+    -> impl Iterator<Item=DrawOp<'a, Coord2D>> + 'a
 {
     // TODO: move below transforms into World struct
     let scale_fac = f64::min(600.0*0.8/2.0, 400.0*0.8/2.0);
@@ -227,7 +243,7 @@ fn project_lines<'a>(
             proj_2d.project(&proj_3d.project(&point))
         });
         let mut draw_op_gen = 
-            ClampedArcIterator::new(ClampedIterator::new(projected));
+            ClampedArcIterator::new(ClampedIterator::new(projected), draw_arc);
         let first_point = draw_op_gen.next();
         if let Some(mut first_point) = first_point {
             let first_coord = first_point.get_coord();
@@ -275,19 +291,22 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
     let country_outlines = country_outlines;
 
     // Debug points
-    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
+    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
+    let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true);
 
     // Project all lines
-    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
-    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()));
-    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()));
+    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
+    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
+    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true);
 
     Some(
         std::iter::once(DrawOp::BeginPath)
             .chain(lat_lines)
             .chain(lon_lines)
-            .chain(country_outlines)
-            .chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
+            //.chain(country_outlines)
+            //.chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
+            .chain(debug_shapes)
+            .chain(std::iter::once(DrawOp::Text(Coord2D { x: 10.0, y: 350.0 }, &context.latlon_str)))
     )
     //Some(std::iter::once(DrawOp::BeginPath)
     //    .chain(lat_lines.map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())

@@ -27,7 +27,7 @@ const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/
 
 // Disable req_animation_frame and update_state loop for debugging
 use std::f64::consts::PI;
-const ANIMATE: bool = false;
+const ANIMATE: bool = true;
 const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
@@ -339,5 +339,14 @@ pub fn main() {
     let draw_loop = CanvasRenderLoop::new(web_sys::window().unwrap(), "canvas", world).wrap();
     CanvasRenderLoop::<World>::init(&draw_loop);
     CanvasRenderLoop::<World>::run(&draw_loop);
+
+    let cb = Box::new(wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+        let draw_loop_handle_for_click_cb = Rc::clone(&draw_loop);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut world = draw_loop_handle_for_click_cb.lock().await;
+            world.state.yaw -= 0.1*PI;
+        })
+    }));
+    web_sys::window().unwrap().add_event_listener_with_callback("click", Box::leak(cb).as_ref().unchecked_ref());
 
 }

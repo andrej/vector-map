@@ -108,7 +108,7 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState + 'static
     width: f64,
     height: f64,
     render_closure: Option<Closure<dyn Fn(f64)>>,
-    state: CanvasRenderLoopStateT,
+    pub state: CanvasRenderLoopStateT,
     last_state_update_t: f64
 }
 

@@ -134,12 +134,15 @@ impl Projection<CoordGeo> for SphereProjection {
     }
 }
 
-fn project_coord3d_to_coordgeo(Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
-    let r = 1.0;
-    //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
-    CoordGeo {
-        latitude: f64::asin(z / r),
-        longitude: f64::atan2(*y, *x),
+impl Projection<Coord3D> for SphereProjection {
+    type To = CoordGeo;
+    fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
+        let r = 1.0;
+        //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
+        CoordGeo {
+            latitude: f64::asin(z / r),
+            longitude: f64::atan2(*y, *x),
+        }
     }
 }
 
@@ -241,8 +244,9 @@ impl Projection<Coord3D> for OrthogonalProjection {
 /// returns the intersection of the line between them and the edge of the
 /// visible area.
 fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D {
-    let outside_rev = project_coord3d_to_coordgeo(&outside);
-    let inside_rev = project_coord3d_to_coordgeo(&inside);
+    let proj = SphereProjection;
+    let outside_rev = proj.project(&outside);
+    let inside_rev = proj.project(&inside);
     let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
     let lon = f64::signum(inside_rev.longitude) * f64::to_radians(90.0);
     let edge_rev = CoordGeo {

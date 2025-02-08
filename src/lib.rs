@@ -64,6 +64,10 @@ where It: Iterator<Item=CoordGeo>
     fill_style: Option<&'a String>
 }
 
+enum MouseState {
+    MouseDown,
+    MouseUp
+}
 /// This is a small struct that contains all the necessary context for a to-be-
 /// drawn frame. Values like the projection parameters and the stroke/fill
 /// styles need to live all the way until the actual drawing takes place, since
@@ -80,7 +84,8 @@ struct World {
     latlon_stroke_style: &'static str,
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
-    latlon_str: String
+    latlon_str: String,
+    mouse_state: MouseState
 }
 
 impl World {
@@ -97,7 +102,8 @@ impl World {
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
             country_outlines: gen_country_outlines(),
-            latlon_str: String::new()
+            latlon_str: String::new(),
+            mouse_state: MouseState::MouseUp
         }
     }
 }
@@ -325,6 +331,25 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
 
 }
 
+fn add_leaky_event_listener(event: &str, cb: impl Fn(web_sys::Event) -> () + 'static) {
+    let cb = Box::new(wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event) -> ()>::new(cb));
+    web_sys::window().unwrap().add_event_listener_with_callback(event, Box::leak(cb).as_ref().unchecked_ref());
+}
+
+fn add_leaky_event_listener_with_state(state: &Rc<Mutex<CanvasRenderLoop<World>>>, event: &str, cb: impl Fn(&mut World, web_sys::Event) -> () + Clone + 'static) {
+    let wrapped_state = Box::leak(Box::new(state.clone()));
+    let wrapped_cb = Box::new(wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event) -> ()>::new(
+        move |e: web_sys::Event| {
+            let my_state = Rc::clone(wrapped_state);
+            let cb = cb.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut my_state_unlocked = my_state.lock().await;
+                cb(&mut my_state_unlocked.state, e);
+            })
+        }));
+    web_sys::window().unwrap().add_event_listener_with_callback(event, Box::leak(wrapped_cb).as_ref().unchecked_ref());
+}
+
 #[wasm_bindgen]
 pub fn main() {
     utils::set_panic_hook();
@@ -340,13 +365,23 @@ pub fn main() {
     CanvasRenderLoop::<World>::init(&draw_loop);
     CanvasRenderLoop::<World>::run(&draw_loop);
 
-    let cb = Box::new(wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
-        let draw_loop_handle_for_click_cb = Rc::clone(&draw_loop);
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut world = draw_loop_handle_for_click_cb.lock().await;
-            world.state.yaw -= 0.1*PI;
-        })
-    }));
-    web_sys::window().unwrap().add_event_listener_with_callback("click", Box::leak(cb).as_ref().unchecked_ref());
+    add_leaky_event_listener_with_state(&draw_loop, "mousedown", move |w: &mut World, e: web_sys::Event| {
+        console_log!("mouse down");
+        w.mouse_state = MouseState::MouseDown;
+    });
+    add_leaky_event_listener_with_state(&draw_loop, "mousemove", move |w: &mut World, e: web_sys::Event| {
+        if let MouseState::MouseDown = w.mouse_state {
+            console_log!("mouse down and moving");
+            let me: web_sys::MouseEvent = e.unchecked_into();
+            let dx = me.movement_x();
+            let dy = me.movement_y();
+            w.yaw -= (-dx as f64)*PI/400.0;
+            w.pitch -= (-dy as f64)*PI/400.0;
+        }
+    });
+    add_leaky_event_listener_with_state(&draw_loop, "mouseup", move |w: &mut World, e: web_sys::Event| {
+        console_log!("mouse up");
+        w.mouse_state = MouseState::MouseUp;
+    });
 
 }

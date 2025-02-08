@@ -85,7 +85,9 @@ struct World {
     country_outlines_stroke_style: &'static str,
     country_outlines_fill_style: &'static str,
     latlon_str: String,
-    mouse_state: MouseState
+    mouse_state: MouseState,
+    yaw_speed: f64,
+    pitch_speed: f64
 }
 
 impl World {
@@ -103,46 +105,57 @@ impl World {
             country_outlines_fill_style: "#039",
             country_outlines: gen_country_outlines(),
             latlon_str: String::new(),
-            mouse_state: MouseState::MouseUp
+            mouse_state: MouseState::MouseUp,
+            yaw_speed: 10.0,
+            pitch_speed: 3.0
         }
     }
 }
 
 impl CanvasRenderLoopState for World
 {
-    fn update(&mut self, t_diff: f64) -> () {
+    fn update(&mut self, t_diff: f64) -> bool {
         let t_diff_s = t_diff/1e3;
-        let yaw_speed = 10.0; // [deg/s]
-        let pitch_speed = 3.0; // [deg/s]
-        let yaw_inc = yaw_speed * t_diff_s;
-        self.yaw = f64::to_radians((f64::to_degrees(self.yaw) - yaw_inc) % 360.0);
-        match self.cur_bounce_direction {
-            BounceDirection::BounceUp(x) => {
-                let pitch_inc = x * t_diff_s;
-                self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
-                if self.pitch > f64::to_radians(5.0) {
-                    self.cur_bounce_direction = BounceDirection::BounceDown(-pitch_speed);
+        let yaw_speed = self.yaw_speed; // [deg/s]
+        let pitch_speed = self.pitch_speed; // [deg/s]
+        let mouse_move = if let MouseState::MouseDown = self.mouse_state { true } else { false };
+        if (yaw_speed == 0.0 || pitch_speed == 0.0) && !mouse_move {
+            return false;
+        }
+
+        if !mouse_move {
+            let yaw_inc = yaw_speed * t_diff_s;
+            self.yaw = f64::to_radians((f64::to_degrees(self.yaw) - yaw_inc) % 360.0);
+            match self.cur_bounce_direction {
+                BounceDirection::BounceUp(x) => {
+                    let pitch_inc = x * t_diff_s;
+                    self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
+                    if self.pitch > f64::to_radians(5.0) {
+                        self.cur_bounce_direction = BounceDirection::BounceDown(-pitch_speed);
+                    }
                 }
-            }
-            BounceDirection::BounceDown(x) => {
-                let pitch_inc = x * t_diff_s;
-                self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
-                if self.pitch < f64::to_radians(-0.0) {
-                    self.cur_bounce_direction = BounceDirection::BounceUp(pitch_speed);
+                BounceDirection::BounceDown(x) => {
+                    let pitch_inc = x * t_diff_s;
+                    self.pitch = f64::to_radians((f64::to_degrees(self.pitch) + pitch_inc));
+                    if self.pitch < f64::to_radians(-0.0) {
+                        self.cur_bounce_direction = BounceDirection::BounceUp(pitch_speed);
+                    }
                 }
             }
         }
-        //self.cur_pitch = f64::to_radians((f64::to_degrees(self.cur_pitch) + 1.0) % 10.0);
+
         self.proj_3d = SphereProjection;
         self.proj_2d = OrthogonalProjection::new_from_angles(self.pitch, self.yaw);
 
         self.latlon_str = String::from(format!("lat: {:3.3} lon: {:3.3}", f64::to_degrees(self.pitch), f64::to_degrees(self.yaw)));
+
+        return true;
     }
 
-    fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
+    fn frame<'a, 'b>(&'a self, canvas_width: f64, canvas_height: f64) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
     where 'a: 'b
     {
-        let draw_ops = gen_frame_draw_ops(&self);
+        let draw_ops = gen_frame_draw_ops(&self, canvas_width, canvas_height);
         if let Some(draw_ops) = draw_ops {
             Option::Some(Box::new(draw_ops))
         } else {
@@ -235,14 +248,16 @@ fn project_lines<'a>(
     proj_2d: &'a OrthogonalProjection,
     start_op: DrawOp<'a, Coord2D>,
     end_op: DrawOp<'a, Coord2D>,
-    draw_arc: bool
+    draw_arc: bool,
+    canvas_width: f64,
+    canvas_height: f64
 ) 
     -> impl Iterator<Item=DrawOp<'a, Coord2D>> + 'a
 {
     // TODO: move below transforms into World struct
-    let scale_fac = f64::min(600.0*0.8/2.0, 400.0*0.8/2.0);
+    let scale_fac = f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
     let scale = Scale2D { x: scale_fac, y: scale_fac };
-    let translate = Translate2D { x: 600.0/2.0, y: 400.0/2.0 };
+    let translate = Translate2D { x: canvas_width/2.0, y: canvas_height/2.0 };
 
     lines.filter_map(move |line| {
         let mut projected = line.map(move |point| {
@@ -286,7 +301,7 @@ fn project_lines<'a>(
 /// them on the fly. The country outlines are stored in memory as absolute 
 /// coordinates, but their projected coordinates change between each frame;
 /// therefore, we map those vectors using projection iterators.
-fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
+fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: f64) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
     // Latitude/longitude line iterator
     let n_latlon_lines = 18;
     let latlon_resolution = 36;
@@ -297,13 +312,13 @@ fn gen_frame_draw_ops<'a>(context: &'a World) -> Option<impl Iterator<Item=DrawO
     let country_outlines = country_outlines;
 
     // Debug points
-    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
-    let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true);
+    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     // Project all lines
-    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
-    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false);
-    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true);
+    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     Some(
         std::iter::once(DrawOp::BeginPath)
@@ -366,12 +381,12 @@ pub fn main() {
     CanvasRenderLoop::<World>::run(&draw_loop);
 
     add_leaky_event_listener_with_state(&draw_loop, "mousedown", move |w: &mut World, e: web_sys::Event| {
-        console_log!("mouse down");
         w.mouse_state = MouseState::MouseDown;
+        w.yaw_speed = 0.0;
+        w.pitch_speed = 0.0;
     });
     add_leaky_event_listener_with_state(&draw_loop, "mousemove", move |w: &mut World, e: web_sys::Event| {
         if let MouseState::MouseDown = w.mouse_state {
-            console_log!("mouse down and moving");
             let me: web_sys::MouseEvent = e.unchecked_into();
             let dx = me.movement_x();
             let dy = me.movement_y();
@@ -380,7 +395,6 @@ pub fn main() {
         }
     });
     add_leaky_event_listener_with_state(&draw_loop, "mouseup", move |w: &mut World, e: web_sys::Event| {
-        console_log!("mouse up");
         w.mouse_state = MouseState::MouseUp;
     });
 

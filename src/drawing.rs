@@ -109,6 +109,7 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState + 'static
     height: f64,
     render_closure: Option<Closure<dyn Fn(f64)>>,
     pub state: CanvasRenderLoopStateT,
+    state_changed: bool,
     last_state_update_t: f64
 }
 
@@ -142,6 +143,7 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
             width: canvas_width,
             height: canvas_height,
             state: state,
+            state_changed: false,
             last_state_update_t: 0.0
         }
     }
@@ -177,8 +179,17 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
         let clos: Closure<dyn Fn(f64)> = Closure::new(move |time: f64| { 
             let fut_this = Rc::clone(&clos_this);
             wasm_bindgen_futures::spawn_local(async move {
-                let mut t = fut_this.lock().await;
-                t.frame(time).await;
+                loop { // loop until the state has changed
+                    { // important that we do not hold lock for the sleep part
+                        let mut t = fut_this.lock().await;
+                        if t.state_changed {
+                            t.frame(time).await;
+                            break;
+                        }
+                    }
+                    // state did not change; no need to redraw
+                    utils::sleep(10).await;
+                }
             });
         });
         //(*this).as_ref().borrow_mut().render_closure = Some(clos);
@@ -221,8 +232,10 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
             let this = &mut *this.lock().await;
             let t_cur = this.performance.now();
             let t_diff = t_cur - this.last_state_update_t;
-            this.state.update(t_diff);
-            this.last_state_update_t = t_cur;
+            this.state_changed = this.state.update(t_diff);
+            if this.state_changed {
+                this.last_state_update_t = t_cur;
+            }
         }
         // It is critical this sleep is outside of the above block; otherwise
         // the lock on `this` is apparently held for the entire time we are
@@ -239,7 +252,7 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
         let tstart = self.performance.now();
 
         self.context.clear_rect(0.0, 0.0, self.width, self.height);
-        let draw_ops = self.state.frame();
+        let draw_ops = self.state.frame(self.width, self.height);
         if let Some(draw_ops) = draw_ops {
             draw_ops.for_each(|op| { 
                 op.draw(&self.context);
@@ -258,7 +271,10 @@ where CanvasRenderLoopStateT: CanvasRenderLoopState
 
 pub trait CanvasRenderLoopState
 {
-    fn frame<'a, 'b>(&'a self) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
+    /// Return the draw operations to draw the current state to screen.
+    fn frame<'a, 'b>(&'a self, canvas_width: f64, canvas_height: f64) -> Option<Box<dyn Iterator<Item=DrawOp<Coord2D>> + 'b>>
     where 'a: 'b;
-    fn update(&mut self, t_diff: f64);
+    /// Update the state of the context; return true if the state changed. A
+    /// frame redraw will only be triggered if the state did change.
+    fn update(&mut self, t_diff: f64) -> bool;
 }

@@ -9,7 +9,7 @@ use futures::lock::Mutex;
 /// would be quite inefficient to e.g. store every point of a line inside of
 /// a "LineTo" operation. For such a use case, a vector of coordinates would 
 /// make more sense; this could then be mapped on-the-fly to this enum.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DrawOp<'a, CoordT> {
     BeginPath,
     MoveTo(CoordT),

@@ -7,7 +7,7 @@ use crate::DrawOp;
 // --------------------------------------------------------------------------
 // CoordGeo
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct CoordGeo {
     pub latitude: f64,
     pub longitude: f64
@@ -97,7 +97,7 @@ fn project_onto_plane(plane_normal: &Coord3D, vector: &Coord3D) -> Coord3D {
 // --------------------------------------------------------------------------
 // Coord2D
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Coord2D {
     pub x: f64,
     pub y: f64
@@ -127,9 +127,9 @@ impl Projection<CoordGeo> for SphereProjection {
         // Positive longitudes are EAST of meridian
         // Positive latitudes are NORTH of the equator
         Coord3D { 
-            x: r * f64::cos(-lon) * f64::cos(-lat),
-            y: r * f64::sin(-lon) * f64::cos(-lat),
-            z: r * f64::sin(-lat) 
+            x: r * f64::cos(lon) * f64::cos(lat),
+            y: r * f64::sin(lon) * f64::cos(lat),
+            z: r * f64::sin(lat) 
         }
     }
 }
@@ -247,14 +247,20 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
     let proj = SphereProjection;
     let outside_rev = proj.project(&outside);
     let inside_rev = proj.project(&inside);
+    console_log!("outside: {:?} -> {:?} -> {:?} // inside: {:?} -> {:?} -> {:?}", outside, outside_rev, proj.project(&outside_rev), inside, inside_rev, proj.project(&inside_rev));
     let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
     let lon = f64::signum(inside_rev.longitude) * f64::to_radians(90.0);
     let edge_rev = CoordGeo {
-        longitude: -lon,
-        latitude: -(inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
+        longitude: lon,
+        latitude: (inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
     };
     let sphere_proj = SphereProjection;
-    let edge = sphere_proj.project(&edge_rev);
+    let mut edge = sphere_proj.project(&edge_rev);
+    // due to floating point inaccuracies, x might be a very small positive 
+    // number at this point, even though we just chose a point that should be
+    // the last visible point. To make sure it doesn't get culled, set it to
+    // 0.0, because that is the accurate solution.
+    edge.x = 0.0;
     edge
 }
 
@@ -300,16 +306,6 @@ where InputIter: Iterator<Item=Coord3D> {
             iter: iter,
             next: Option::None 
         }
-    }
-
-    fn next_visible(&mut self) -> (Option<Coord3D>, Option<Coord3D>) {
-        let mut maybe_before_current = Option::None;
-        let mut maybe_current = self.iter.next();
-        while maybe_current.is_some() && maybe_current.unwrap().x < 0.0 {
-            maybe_before_current = maybe_current;
-            maybe_current = self.iter.next();
-        }
-        (maybe_before_current, maybe_current)
     }
 }
 
@@ -378,18 +374,22 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
     a: Option<ClampedIteratorPoint>,
     b: Option<ClampedIteratorPoint>,
     draw_arc: bool,
+    arc_center: Coord2D,
+    arc_radius: f64,
     _phantom: std::marker::PhantomData<&'a InputIter>
 }
 
 impl<'a, InputIter> ClampedArcIterator<'a, InputIter>
 where InputIter: Iterator<Item=ClampedIteratorPoint> {
-    pub fn new(mut iter: InputIter, draw_arc: bool) -> Self {
+    pub fn new(mut iter: InputIter, draw_arc: bool, arc_center: Coord2D, arc_radius: f64) -> Self {
         let next = iter.next();
         Self {
             iter: iter,
             a: Option::None,
             b: next,
             draw_arc: draw_arc,
+            arc_center: arc_center,
+            arc_radius: arc_radius,
             _phantom: std::marker::PhantomData
         }
     }
@@ -414,9 +414,9 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
                     let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
                     if angle_a < angle_b {
-                        Some(DrawOp::Arc(Coord2D { x: 300.0, y: 200.0 }, 160.0, angle_a, angle_b))
+                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b))
                     } else {
-                        Some(DrawOp::Arc(Coord2D { x: 300.0, y: 200.0 }, 160.0, angle_b, angle_a))
+                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_b, angle_a))
                     }
                 } else {
                     Some(DrawOp::MoveTo(Coord2D { x: b.y, y: b.z }))

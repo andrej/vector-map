@@ -27,7 +27,7 @@ const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/
 
 // Disable req_animation_frame and update_state loop for debugging
 use std::f64::consts::PI;
-const ANIMATE: bool = true;
+const ANIMATE: bool = false;
 const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
@@ -40,7 +40,8 @@ const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
      ],
 
 ];
-const START_LON: f64 = 1.05*PI; //0.2*PI;
+const START_LON: f64 = -117.133 / 360.0 * (2.0*PI);  // 88.9
+const START_LAT: f64 = 2.596 / 360.0 * (2.0*PI);
 
 enum BounceDirection {
     BounceUp(f64),
@@ -93,7 +94,7 @@ struct World {
 impl World {
     fn new() -> Self {
         let yaw = START_LON;
-        let pitch = f64::to_radians(3.0);
+        let pitch = START_LAT;
         Self {
             yaw: yaw,
             pitch: pitch,
@@ -103,10 +104,10 @@ impl World {
             latlon_stroke_style: "#ccc",
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
-            country_outlines: gen_country_outlines(),
+            country_outlines: Vec::new(), //gen_country_outlines(),
             latlon_str: String::new(),
             mouse_state: MouseState::MouseUp,
-            yaw_speed: 10.0,
+            yaw_speed: 0.1,
             pitch_speed: 3.0
         }
     }
@@ -261,10 +262,23 @@ fn project_lines<'a>(
 
     lines.filter_map(move |line| {
         let mut projected = line.map(move |point| {
+            //console_log!("{:?}", point);
             proj_2d.project(&proj_3d.project(&point))
         });
+        // TODO: move arc_center, arc_radius to be applied when we apply the scale and translate transforms below;
+        // the clampedArcIterator really should just return arcs with center at 0.0 and radius 1 or something like that
         let mut draw_op_gen = 
-            ClampedArcIterator::new(ClampedIterator::new(projected), draw_arc);
+            ClampedArcIterator::new(
+                ClampedIterator::new(projected).map(|x| { 
+                    //console_log!("{:?}", x); 
+                x}), 
+                draw_arc,
+                Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
+                scale_fac
+            )
+        .map(|x| { 
+            //console_log!("{:?}", x); 
+        x});
         let first_point = draw_op_gen.next();
         if let Some(mut first_point) = first_point {
             let first_coord = first_point.get_coord();
@@ -312,13 +326,13 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
     let country_outlines = country_outlines;
 
     // Debug points
-    let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    //let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
     let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     // Project all lines
     let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
     let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
+    //let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     Some(
         std::iter::once(DrawOp::BeginPath)

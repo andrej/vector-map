@@ -31,17 +31,16 @@ const ANIMATE: bool = false;
 const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
-const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
+const DEBUG_SHAPES: [[CoordGeo; 4]; 1] = [
     [CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.5*PI },
-     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI },
-     CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
+     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI }
      ],
 
 ];
-const START_LON: f64 = -117.133 / 360.0 * (2.0*PI);  // 88.9
-const START_LAT: f64 = 2.596 / 360.0 * (2.0*PI);
+const START_LON: f64 = -81.516 / 360.0 * (2.0*PI);  // 88.9
+const START_LAT: f64 = 0.961 / 360.0 * (2.0*PI);
 
 enum BounceDirection {
     BounceUp(f64),
@@ -270,7 +269,7 @@ fn project_lines<'a>(
         let mut draw_op_gen = 
             ClampedArcIterator::new(
                 ClampedIterator::new(projected).map(|x| { 
-                    //console_log!("{:?}", x); 
+                    console_log!("{:?}", x); 
                 x}), 
                 draw_arc,
                 Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
@@ -330,14 +329,14 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
     let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     // Project all lines
-    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    //let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    //let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
     //let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     Some(
         std::iter::once(DrawOp::BeginPath)
-            .chain(lat_lines)
-            .chain(lon_lines)
+            //.chain(lat_lines)
+            //.chain(lon_lines)
             //.chain(country_outlines)
             //.chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
             .chain(debug_shapes)

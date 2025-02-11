@@ -245,11 +245,21 @@ impl Projection<Coord3D> for OrthogonalProjection {
 /// visible area.
 fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D {
     let proj = SphereProjection;
-    let outside_rev = proj.project(&outside);
-    let inside_rev = proj.project(&inside);
-    console_log!("outside: {:?} -> {:?} -> {:?} // inside: {:?} -> {:?} -> {:?}", outside, outside_rev, proj.project(&outside_rev), inside, inside_rev, proj.project(&inside_rev));
+    let mut outside_rev = proj.project(&outside);
+    let mut inside_rev = proj.project(&inside);
+    let mut lon_diff = outside_rev.longitude - inside_rev.longitude;
+    // sgn needs to be -1 if we are in the left hemisphere, +1 if in the right
+    // (i.e. we will clamp the longitude to -90 deg or +90 deg)
+    // if I have to increase the longitude to get from inside_rev to outside_rev
+    // on the shortest path, it's in the left hemisphere; if I have to decrease 
+    // the longitude, it's in the right
+    if lon_diff > std::f64::consts::PI || lon_diff < -std::f64::consts::PI {
+        lon_diff = -(lon_diff - std::f64::consts::PI);
+    }
+    let sgn = f64::signum(-lon_diff);
+    //console_log!("outside: {:?} -> {:?} -> {:?} // inside: {:?} -> {:?} -> {:?}", outside, outside_rev, proj.project(&outside_rev), inside, inside_rev, proj.project(&inside_rev));
     let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
-    let lon = f64::signum(inside_rev.longitude) * f64::to_radians(90.0);
+    let lon = sgn * f64::to_radians(90.0);
     let edge_rev = CoordGeo {
         longitude: lon,
         latitude: (inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
@@ -295,16 +305,19 @@ impl ClampedIteratorPoint {
 
 pub struct ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
-    iter: InputIter,
+    iter: std::iter::Chain<std::iter::Chain<std::iter::Once<Coord3D>, InputIter>, std::iter::Once<Coord3D>>,
     next: Option<ClampedIteratorPoint>,
+    after_next: Option<ClampedIteratorPoint>
 }
 
 impl<InputIter> ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     pub fn new(mut iter: InputIter) -> Self {
+        let first = iter.next().unwrap();
         Self {
-            iter: iter,
-            next: Option::None 
+            iter: std::iter::once(first).chain(iter).chain(std::iter::once(first)),
+            next: Option::None,
+            after_next: Option::None 
         }
     }
 }
@@ -317,11 +330,13 @@ where InputIter: Iterator<Item=Coord3D> {
         let current = match self.next.clone() {
             Some(LastVisible(p)) => {
                 // return LastVisibles immediately; we start fresh after this
-                self.next = None;
+                self.next = self.after_next.clone();
+                self.after_next = None;
                 return Some(LastVisible(p))
             },
             Some(Visible(p)) | Some(FirstVisible(p)) => {
-                self.next = None;
+                self.next = self.after_next.clone();
+                self.after_next = None;
                 p
             },
             None => self.iter.next()?
@@ -335,6 +350,10 @@ where InputIter: Iterator<Item=Coord3D> {
                     // next is invisible; clamp and enqueue it as LastVisible
                     let next_clamped = get_viewport_intersection_point(current, next);
                     self.next = Some(LastVisible(next_clamped));
+                    // The intersection between next and the point after next
+                    // might not be at LastVisible ...
+                    // Visible here is a lie, but we handle it correctly.
+                    self.after_next = Some(Visible(next));
                 } else {
                     // next is visible
                     self.next = Some(Visible(next));
@@ -413,7 +432,7 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     use std::f64::consts::PI;
                     let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
                     let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
-                    if angle_a < angle_b {
+                    if angle_a <= angle_b {
                         Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b))
                     } else {
                         Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_b, angle_a))

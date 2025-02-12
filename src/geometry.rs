@@ -257,7 +257,6 @@ fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D
         lon_diff = -(lon_diff - std::f64::consts::PI);
     }
     let sgn = f64::signum(-lon_diff);
-    //console_log!("outside: {:?} -> {:?} -> {:?} // inside: {:?} -> {:?} -> {:?}", outside, outside_rev, proj.project(&outside_rev), inside, inside_rev, proj.project(&inside_rev));
     let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
     let lon = sgn * f64::to_radians(90.0);
     let edge_rev = CoordGeo {
@@ -305,7 +304,7 @@ impl ClampedIteratorPoint {
 
 pub struct ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
-    iter: std::iter::Chain<std::iter::Chain<std::iter::Once<Coord3D>, InputIter>, std::iter::Once<Coord3D>>,
+    iter: InputIter,
     next: Option<ClampedIteratorPoint>,
     after_next: Option<ClampedIteratorPoint>
 }
@@ -313,11 +312,25 @@ where InputIter: Iterator<Item=Coord3D> {
 impl<InputIter> ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     pub fn new(mut iter: InputIter) -> Self {
-        let first = iter.next().unwrap();
         Self {
-            iter: std::iter::once(first).chain(iter).chain(std::iter::once(first)),
+            iter: iter,
             next: Option::None,
             after_next: Option::None 
+        }
+    }
+
+    fn next(&mut self) -> Option<Coord3D> {
+        use ClampedIteratorPoint::*;
+        match self.next.clone() {
+            Some(LastVisible(p)) | Some(Visible(p)) | Some(FirstVisible(p)) =>
+            {
+                self.next = self.after_next.clone();
+                Some(p)
+            }
+            None =>
+            {
+                self.iter.next()
+            }
         }
     }
 }
@@ -326,6 +339,7 @@ impl<InputIter> Iterator for ClampedIterator<InputIter>
 where InputIter: Iterator<Item=Coord3D> {
     type Item = ClampedIteratorPoint;
     fn next(&mut self) -> Option<ClampedIteratorPoint> {
+
         use ClampedIteratorPoint::*;
         let current = match self.next.clone() {
             Some(LastVisible(p)) => {
@@ -375,6 +389,7 @@ where InputIter: Iterator<Item=Coord3D> {
                 }
                 maybe_before_next_visible = it;
             }
+            assert!(maybe_next_visible.is_some() && maybe_before_next_visible.is_some() || !maybe_next_visible.is_some());
             if let (Some(before_next_visible), Some(next_visible)) = (maybe_before_next_visible, maybe_next_visible) {
                 let next_clamped = get_viewport_intersection_point(next_visible, before_next_visible);
                 self.next = Some(Visible(next_visible));
@@ -392,6 +407,7 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
     iter: InputIter,
     a: Option<ClampedIteratorPoint>,
     b: Option<ClampedIteratorPoint>,
+    first: Option<ClampedIteratorPoint>,
     draw_arc: bool,
     arc_center: Coord2D,
     arc_radius: f64,
@@ -401,11 +417,12 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
 impl<'a, InputIter> ClampedArcIterator<'a, InputIter>
 where InputIter: Iterator<Item=ClampedIteratorPoint> {
     pub fn new(mut iter: InputIter, draw_arc: bool, arc_center: Coord2D, arc_radius: f64) -> Self {
-        let next = iter.next();
+        let first = iter.next();
         Self {
             iter: iter,
             a: Option::None,
-            b: next,
+            b: first.clone(),
+            first: first,
             draw_arc: draw_arc,
             arc_center: arc_center,
             arc_radius: arc_radius,
@@ -419,16 +436,20 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
     type Item = DrawOp<'a, Coord2D>;
     fn next(&mut self) -> Option<DrawOp<'a, Coord2D>> {
         use ClampedIteratorPoint::*;
+        let next = match self.iter.next() {
+            p@Some(_) => p,
+            None => { let p = self.first.clone(); self.first = None; p }
+        };
         let a = self.a.clone();
         let b = self.b.clone();
         self.a = b.clone();
-        self.b = self.iter.next();
+        self.b = next;
 
         match (a, b) {
             (Some(LastVisible(a)), Some(FirstVisible(b))) => {
                 if self.draw_arc {
-                    let (ax, ay) = (a.y, a.z);
-                    let (bx, by) = (b.y, b.z);
+                    let (ax, ay) = (a.y, -a.z);
+                    let (bx, by) = (b.y, -b.z);
                     use std::f64::consts::PI;
                     let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
                     let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
@@ -438,14 +459,14 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                         Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_b, angle_a))
                     }
                 } else {
-                    Some(DrawOp::MoveTo(Coord2D { x: b.y, y: b.z }))
+                    Some(DrawOp::MoveTo(Coord2D { x: b.y, y: -b.z }))
                 }
             },
             (_, Some(FirstVisible(p))) 
-                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: p.z })),
+                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z })),
             (_, Some(Visible(p)))  |
             (_, Some(LastVisible(p))) 
-                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: p.z })),
+                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z })),
             (_, None) => None
         }
     }

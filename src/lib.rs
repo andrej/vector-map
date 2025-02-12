@@ -27,15 +27,16 @@ const BOUNDARIES_SHP: &[u8; 161661560] = include_bytes!("geoBoundariesCGAZ_ADM0/
 
 // Disable req_animation_frame and update_state loop for debugging
 use std::f64::consts::PI;
-const ANIMATE: bool = false;
+const ANIMATE: bool = true;
 const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
-const DEBUG_SHAPES: [[CoordGeo; 4]; 1] = [
+const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
     [CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.5*PI },
-     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI }
+     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI },
+     CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
      ],
 
 ];
@@ -260,24 +261,22 @@ fn project_lines<'a>(
     let translate = Translate2D { x: canvas_width/2.0, y: canvas_height/2.0 };
 
     lines.filter_map(move |line| {
-        let mut projected = line.map(move |point| {
-            //console_log!("{:?}", point);
+        let projected = line.map(move |point| {
             proj_2d.project(&proj_3d.project(&point))
         });
         // TODO: move arc_center, arc_radius to be applied when we apply the scale and translate transforms below;
         // the clampedArcIterator really should just return arcs with center at 0.0 and radius 1 or something like that
         let mut draw_op_gen = 
             ClampedArcIterator::new(
-                ClampedIterator::new(projected).map(|x| { 
-                    console_log!("{:?}", x); 
-                x}), 
+                ClampedIterator::new(projected)
+                //.map(|x| { console_log!("{:?}", x); x})
+                , 
                 draw_arc,
                 Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
                 scale_fac
             )
-        .map(|x| { 
-            //console_log!("{:?}", x); 
-        x});
+            //.map(|x| {  console_log!("{:?}", x); x})
+        ;
         let first_point = draw_op_gen.next();
         if let Some(mut first_point) = first_point {
             let first_coord = first_point.get_coord();
@@ -326,36 +325,31 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
 
     // Debug points
     //let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    let debug_shapes = project_lines(DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
+    let debug_shapes = project_lines(
+        DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), 
+        &context.proj_3d, 
+        &context.proj_2d, 
+        DrawOp::BeginPath, 
+        DrawOp::Fill(context.country_outlines_fill_style.to_string()), 
+        true, 
+        canvas_width, 
+        canvas_height
+    );
 
     // Project all lines
-    //let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    //let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    //let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
+    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     Some(
         std::iter::once(DrawOp::BeginPath)
-            //.chain(lat_lines)
-            //.chain(lon_lines)
-            //.chain(country_outlines)
+            .chain(lat_lines)
+            .chain(lon_lines)
+            .chain(country_outlines)
             //.chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
             .chain(debug_shapes)
             .chain(std::iter::once(DrawOp::Text(Coord2D { x: 10.0, y: 350.0 }, &context.latlon_str)))
     )
-    //Some(std::iter::once(DrawOp::BeginPath)
-    //    .chain(lat_lines.map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
-    //    .chain(lon_lines.map(coord_iter_into_draw_ops).map(move |ops| { ops.chain(std::iter::once(DrawOp::Stroke(context.latlon_stroke_style.to_string()))) }).flatten())
-    //    .chain(country_outlines
-    //        .map(coord_iter_into_draw_ops)
-    //        .map(move |ops| { 
-    //            ops
-    //                .chain(std::iter::once(DrawOp::Stroke(context.country_outlines_stroke_style.to_string())))
-    //                .chain(std::iter::once(DrawOp::Fill(context.country_outlines_fill_style.to_string()))) })
-    //        .flatten())
-    //    .chain(debug_points.map(|l| { l.map(|p| {
-    //        DrawOp::BigRedCircle(p)
-    //    }) }).flatten())
-    // )
 
 }
 
@@ -404,7 +398,7 @@ pub fn main() {
             let dx = me.movement_x();
             let dy = me.movement_y();
             w.yaw -= (-dx as f64)*PI/400.0;
-            w.pitch -= (-dy as f64)*PI/400.0;
+            w.pitch -= (dy as f64)*PI/400.0;
         }
     });
     add_leaky_event_listener_with_state(&draw_loop, "mouseup", move |w: &mut World, e: web_sys::Event| {

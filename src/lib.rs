@@ -40,8 +40,8 @@ const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
      ],
 
 ];
-const START_LON: f64 = -81.516 / 360.0 * (2.0*PI);  // 88.9
-const START_LAT: f64 = 0.961 / 360.0 * (2.0*PI);
+const START_LON: f64 = 202.363 / 360.0 * (2.0*PI);  // 88.9
+const START_LAT: f64 = -1.831 / 360.0 * (2.0*PI);
 
 enum BounceDirection {
     BounceUp(f64),
@@ -104,7 +104,7 @@ impl World {
             latlon_stroke_style: "#ccc",
             country_outlines_stroke_style: "#fff",
             country_outlines_fill_style: "#039",
-            country_outlines: Vec::new(), //gen_country_outlines(),
+            country_outlines: gen_country_outlines(),
             latlon_str: String::new(),
             mouse_state: MouseState::MouseUp,
             yaw_speed: 0.1,
@@ -347,7 +347,7 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
             .chain(lon_lines)
             .chain(country_outlines)
             //.chain(debug_points.filter_map(|op| if let Some(&coord) = op.get_coord() { Option::Some(DrawOp::BigRedCircle(coord)) } else { Option::None }))
-            .chain(debug_shapes)
+            //.chain(debug_shapes)
             .chain(std::iter::once(DrawOp::Text(Coord2D { x: 10.0, y: 350.0 }, &context.latlon_str)))
     )
 

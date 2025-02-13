@@ -454,9 +454,9 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
                     let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
                     if angle_a <= angle_b {
-                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b))
+                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, false))
                     } else {
-                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_b, angle_a))
+                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, true))
                     }
                 } else {
                     Some(DrawOp::MoveTo(Coord2D { x: b.y, y: -b.z }))

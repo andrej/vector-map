@@ -18,7 +18,7 @@ pub enum DrawOp<'a, CoordT> {
     Stroke(String),
     Fill(String),
     BigRedCircle(CoordT),
-    Arc(CoordT, f64, f64, f64),
+    Arc(CoordT, f64, f64, f64, bool),
     Text(CoordT, &'a String)
 }
 
@@ -75,8 +75,12 @@ impl<'a> DrawOp<'a, Coord2D> {
                 context.set_fill_style_str("red");
                 context.fill();
             },
-            DrawOp::Arc(Coord2D { x, y}, radius, from_angle, to_angle) => {
-                context.arc(*x, *y, *radius, *from_angle, *to_angle);
+            DrawOp::Arc(Coord2D { x, y}, radius, from_angle, to_angle, reverse) => {
+                if !reverse {
+                    context.arc(*x, *y, *radius, *from_angle, *to_angle);
+                } else {
+                    context.arc_with_anticlockwise(*x, *y, *radius, *from_angle, *to_angle, true);
+                }
             },
             DrawOp::Text(Coord2D { x, y}, text) => {
                 context.fill_text(text.as_str(), *x, *y);

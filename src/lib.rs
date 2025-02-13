@@ -32,16 +32,16 @@ const DEBUG_POINTS: [CoordGeo; 1] = [
     CoordGeo { latitude: 0.0, longitude: 0.0 }
 ];
 const DEBUG_SHAPES: [[CoordGeo; 5]; 1] = [
-    [CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
+    [CoordGeo { latitude: -0.3*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.0 },
      CoordGeo { latitude: 0.3*PI, longitude: 0.5*PI },
-     CoordGeo { latitude: 0.1*PI, longitude: 0.5*PI },
-     CoordGeo { latitude: 0.1*PI, longitude: 0.0 },
+     CoordGeo { latitude: -0.3*PI, longitude: 0.5*PI },
+     CoordGeo { latitude: -0.3*PI, longitude: 0.0 },
      ],
 
 ];
-const START_LON: f64 = 202.363 / 360.0 * (2.0*PI);  // 88.9
-const START_LAT: f64 = -1.831 / 360.0 * (2.0*PI);
+const START_LON: f64 = 160.0 / 360.0 * (2.0*PI);  // 88.9
+const START_LAT: f64 = 0.0 / 360.0 * (2.0*PI);
 
 enum BounceDirection {
     BounceUp(f64),

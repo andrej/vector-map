@@ -127,8 +127,8 @@ impl Projection<CoordGeo> for SphereProjection {
         // Positive longitudes are EAST of meridian
         // Positive latitudes are NORTH of the equator
         Coord3D { 
-            x: r * f64::cos(lon) * f64::cos(lat),
-            y: r * f64::sin(lon) * f64::cos(lat),
+            x: r * f64::cos(-lon) * f64::cos(lat),
+            y: r * f64::sin(-lon) * f64::cos(lat),
             z: r * f64::sin(lat) 
         }
     }
@@ -141,7 +141,7 @@ impl Projection<Coord3D> for SphereProjection {
         //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
         CoordGeo {
             latitude: f64::asin(z / r),
-            longitude: f64::atan2(*y, *x),
+            longitude: -f64::atan2(*y, *x),
         }
     }
 }
@@ -451,13 +451,13 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     let (ax, ay) = (a.y, -a.z);
                     let (bx, by) = (b.y, -b.z);
                     use std::f64::consts::PI;
-                    let angle_a = (f64::atan2(ay, ax) + 2.0*PI) % (2.0*PI);
-                    let angle_b = (f64::atan2(by, bx) + 2.0*PI) % (2.0*PI);
-                    if angle_a <= angle_b {
-                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, false))
-                    } else {
-                        Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, true))
-                    }
+                    let angle_a = (f64::atan2(ay, ax)); // + 2.0*PI) % (2.0*PI);
+                    let angle_b = (f64::atan2(by, bx)); // + 2.0*PI) % (2.0*PI);
+                    //console_log!("ax {:?}, ay {:?}, angle {:?}", ax, ay, angle_a);
+                    //console_log!("bx {:?}, by {:?}, angle {:?}", bx, by, angle_b);
+                    let angle_diff = ((angle_b-angle_a + PI) % PI) - PI;
+                    assert!(f64::abs(angle_diff) <= 1.01*PI);
+                    Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, angle_diff>0.0))
                 } else {
                     Some(DrawOp::MoveTo(Coord2D { x: b.y, y: -b.z }))
                 }

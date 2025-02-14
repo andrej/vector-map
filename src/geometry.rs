@@ -451,13 +451,10 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     let (ax, ay) = (a.y, -a.z);
                     let (bx, by) = (b.y, -b.z);
                     use std::f64::consts::PI;
-                    let angle_a = (f64::atan2(ay, ax)); // + 2.0*PI) % (2.0*PI);
-                    let angle_b = (f64::atan2(by, bx)); // + 2.0*PI) % (2.0*PI);
-                    //console_log!("ax {:?}, ay {:?}, angle {:?}", ax, ay, angle_a);
-                    //console_log!("bx {:?}, by {:?}, angle {:?}", bx, by, angle_b);
-                    let angle_diff = ((angle_b-angle_a + PI) % PI) - PI;
-                    assert!(f64::abs(angle_diff) <= 1.01*PI);
-                    Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, angle_diff>0.0))
+                    let angle_a = f64::atan2(ay, ax);
+                    let angle_b = f64::atan2(by, bx);
+                    let angle_diff = (angle_b - angle_a + 2.0*PI) % (2.0*PI);
+                    Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, angle_diff>PI))
                 } else {
                     Some(DrawOp::MoveTo(Coord2D { x: b.y, y: -b.z }))
                 }

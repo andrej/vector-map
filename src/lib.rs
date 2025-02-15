@@ -1,16 +1,21 @@
 /*
 TODO:
-[ ] Fix culling issues (lines connecting visible and culled points do not get
+[x] Fix culling issues (lines connecting visible and culled points do not get
     drawn, which at times leads to bad shapes)
 [x] Fix off-by-one error on lat/lon lines
 [x] Properly keep track of elapsed time between frames instead of advancing by
     a fixed amount
-[ ] Figure out why I'm having to do negative latitudes to get a right-side up
+[x] Figure out why I'm having to do negative latitudes to get a right-side up
     (North pole up) globe currently. Probably a mistake in the projection
-[ ] Add zoom/pan capabilities to projection
-[ ] Add user interaction
+    -> Canvas Y axis grows downwards
+    -> Canvas X axis increases right, but positive longitudes mean going left
+[ ] Add zoom capabilities to projection, including clipping to viewport
+[x] Add user interaction
+[ ] Improve panning
 [ ] Be smarter about shape simplification (currently only looking at +/- 1 deg
     difference)
+[ ] Fix projection issues when latitude > 45 deg
+[ ] Fix hard-coded arc center/radius
 */
 mod utils;
 mod geometry;
@@ -261,17 +266,19 @@ fn project_lines<'a>(
     let translate = Translate2D { x: canvas_width/2.0, y: canvas_height/2.0 };
 
     lines.filter_map(move |line| {
-        let projected = line.map(move |point| {
+        let projected = into_clamped_iter(line.map(move |point| {
             proj_2d.project(&proj_3d.project(&point))
-        });
+        }));
         // TODO: move arc_center, arc_radius to be applied when we apply the scale and translate transforms below;
         // the clampedArcIterator really should just return arcs with center at 0.0 and radius 1 or something like that
         let mut draw_op_gen = 
             ClampedArcIterator::new(
-                ClampedIterator::new(projected)
+                //ClampedIterator::new(
+                    ClampedIterator::new(projected, |p| { p.x <= 0.0 })
+                //, |p| { f64::abs(p.y) < 0.5 && f64::abs(p.z) < 0.5 })
                 //.map(|x| { console_log!("{:?}", x); x})
                 , 
-                draw_arc,
+                draw_arc, //draw_arc,
                 Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
                 scale_fac
             )
@@ -316,7 +323,7 @@ fn project_lines<'a>(
 fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: f64) -> Option<impl Iterator<Item=DrawOp<Coord2D>> + 'a> {
     // Latitude/longitude line iterator
     let n_latlon_lines = 18;
-    let latlon_resolution = 36;
+    let latlon_resolution = 72;
     let (lat_lines, lon_lines) = gen_lat_lon_lines(n_latlon_lines, latlon_resolution);
 
     // Country outline iterator

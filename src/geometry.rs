@@ -302,41 +302,37 @@ impl ClampedIteratorPoint {
     }
 }
 
-pub struct ClampedIterator<InputIter>
-where InputIter: Iterator<Item=Coord3D> {
-    iter: InputIter,
-    next: Option<ClampedIteratorPoint>,
-    after_next: Option<ClampedIteratorPoint>
+pub fn into_clamped_iter(iter: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=ClampedIteratorPoint> {
+    iter.map(|point| ClampedIteratorPoint::Visible(point))
 }
 
-impl<InputIter> ClampedIterator<InputIter>
-where InputIter: Iterator<Item=Coord3D> {
-    pub fn new(mut iter: InputIter) -> Self {
+pub struct ClampedIterator<InputIter, IsVisibleFnT>
+where InputIter: Iterator<Item=ClampedIteratorPoint>,
+IsVisibleFnT: Fn(Coord3D) -> bool
+{
+    iter: InputIter,
+    next: Option<ClampedIteratorPoint>,
+    after_next: Option<ClampedIteratorPoint>,
+    is_visible_fn: IsVisibleFnT
+}
+
+impl<InputIter, IsVisibleFnT> ClampedIterator<InputIter, IsVisibleFnT>
+where InputIter: Iterator<Item=ClampedIteratorPoint>,
+IsVisibleFnT: Fn(Coord3D) -> bool
+{
+    pub fn new(mut iter: InputIter, is_visible_fn: IsVisibleFnT) -> Self {
         Self {
             iter: iter,
             next: Option::None,
-            after_next: Option::None 
-        }
-    }
-
-    fn next(&mut self) -> Option<Coord3D> {
-        use ClampedIteratorPoint::*;
-        match self.next.clone() {
-            Some(LastVisible(p)) | Some(Visible(p)) | Some(FirstVisible(p)) =>
-            {
-                self.next = self.after_next.clone();
-                Some(p)
-            }
-            None =>
-            {
-                self.iter.next()
-            }
+            after_next: Option::None,
+            is_visible_fn: is_visible_fn
         }
     }
 }
 
-impl<InputIter> Iterator for ClampedIterator<InputIter>
-where InputIter: Iterator<Item=Coord3D> {
+impl<InputIter, IsVisibleFnT> Iterator for ClampedIterator<InputIter, IsVisibleFnT>
+where InputIter: Iterator<Item=ClampedIteratorPoint>,
+IsVisibleFnT: Fn(Coord3D) -> bool {
     type Item = ClampedIteratorPoint;
     fn next(&mut self) -> Option<ClampedIteratorPoint> {
 
@@ -353,24 +349,39 @@ where InputIter: Iterator<Item=Coord3D> {
                 self.after_next = None;
                 p
             },
-            None => self.iter.next()?
+            None => match self.iter.next() {
+                None => return None,
+                // FIXME below code is literally copy pasted ...
+                Some(LastVisible(p)) => {
+                    // return LastVisibles immediately; we start fresh after this
+                    self.next = self.after_next.clone();
+                    self.after_next = None;
+                    return Some(LastVisible(p))
+                },
+                Some(Visible(p)) | Some(FirstVisible(p)) => {
+                    self.next = self.after_next.clone();
+                    self.after_next = None;
+                    p
+                },
+            }
         };
         
-        if current.x <= 0.0 {
+        if (self.is_visible_fn)(current) {
             // current is visible
             let maybe_next = self.iter.next();
             if let Some(next) = maybe_next { 
-                if next.x > 0.0 {
+                let next = next.get_coord();
+                if !(self.is_visible_fn)(*next) {
                     // next is invisible; clamp and enqueue it as LastVisible
-                    let next_clamped = get_viewport_intersection_point(current, next);
+                    let next_clamped = get_viewport_intersection_point(current, *next);
                     self.next = Some(LastVisible(next_clamped));
                     // The intersection between next and the point after next
                     // might not be at LastVisible ...
                     // Visible here is a lie, but we handle it correctly.
-                    self.after_next = Some(Visible(next));
+                    self.after_next = Some(Visible(*next));
                 } else {
                     // next is visible
-                    self.next = Some(Visible(next));
+                    self.next = Some(Visible(*next));
                 }
             }
             // Return this point as regular Visible
@@ -381,13 +392,14 @@ where InputIter: Iterator<Item=Coord3D> {
             // find next visible
             let mut maybe_before_next_visible = Option::Some(current);
             let mut maybe_next_visible = Option::None;
-            while let it@Some(next_visible) = self.iter.next() {
-                if next_visible.x <= 0.0 {
+            while let Some(next_visible) = self.iter.next() {
+                let next_visible = next_visible.get_coord();
+                if (self.is_visible_fn)(*next_visible) {
                     // found visible point
-                    maybe_next_visible = it;
+                    maybe_next_visible = Some(*next_visible);
                     break;
                 }
-                maybe_before_next_visible = it;
+                maybe_before_next_visible = Some(*next_visible);
             }
             assert!(maybe_next_visible.is_some() && maybe_before_next_visible.is_some() || !maybe_next_visible.is_some());
             if let (Some(before_next_visible), Some(next_visible)) = (maybe_before_next_visible, maybe_next_visible) {

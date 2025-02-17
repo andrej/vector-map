@@ -243,7 +243,7 @@ impl Projection<Coord3D> for OrthogonalProjection {
 /// Takes two points, one inside the viewport, the other outside of it, and
 /// returns the intersection of the line between them and the edge of the
 /// visible area.
-fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D {
+pub fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coord3D {
     let proj = SphereProjection;
     let mut outside_rev = proj.project(&outside);
     let mut inside_rev = proj.project(&inside);
@@ -306,33 +306,38 @@ pub fn into_clamped_iter(iter: impl Iterator<Item=Coord3D>) -> impl Iterator<Ite
     iter.map(|point| ClampedIteratorPoint::Visible(point))
 }
 
-pub struct ClampedIterator<InputIter, IsVisibleFnT>
+pub struct ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
 where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool
+IsVisibleFnT: Fn(Coord3D) -> bool,
+ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D
 {
     iter: InputIter,
     next: Option<ClampedIteratorPoint>,
     after_next: Option<ClampedIteratorPoint>,
-    is_visible_fn: IsVisibleFnT
+    is_visible_fn: IsVisibleFnT,
+    clamp_fn: ClampFnT
 }
 
-impl<InputIter, IsVisibleFnT> ClampedIterator<InputIter, IsVisibleFnT>
+impl<InputIter, IsVisibleFnT, ClampFnT> ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
 where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool
+IsVisibleFnT: Fn(Coord3D) -> bool,
+ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D
 {
-    pub fn new(mut iter: InputIter, is_visible_fn: IsVisibleFnT) -> Self {
+    pub fn new(mut iter: InputIter, is_visible_fn: IsVisibleFnT, clamp_fn: ClampFnT) -> Self {
         Self {
             iter: iter,
             next: Option::None,
             after_next: Option::None,
-            is_visible_fn: is_visible_fn
+            is_visible_fn: is_visible_fn,
+            clamp_fn: clamp_fn
         }
     }
 }
 
-impl<InputIter, IsVisibleFnT> Iterator for ClampedIterator<InputIter, IsVisibleFnT>
+impl<InputIter, IsVisibleFnT, ClampFnT> Iterator for ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
 where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool {
+IsVisibleFnT: Fn(Coord3D) -> bool,
+ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
     type Item = ClampedIteratorPoint;
     fn next(&mut self) -> Option<ClampedIteratorPoint> {
 
@@ -373,7 +378,7 @@ IsVisibleFnT: Fn(Coord3D) -> bool {
                 let next = next.get_coord();
                 if !(self.is_visible_fn)(*next) {
                     // next is invisible; clamp and enqueue it as LastVisible
-                    let next_clamped = get_viewport_intersection_point(current, *next);
+                    let next_clamped = (self.clamp_fn)(current, *next);
                     self.next = Some(LastVisible(next_clamped));
                     // The intersection between next and the point after next
                     // might not be at LastVisible ...
@@ -403,7 +408,7 @@ IsVisibleFnT: Fn(Coord3D) -> bool {
             }
             assert!(maybe_next_visible.is_some() && maybe_before_next_visible.is_some() || !maybe_next_visible.is_some());
             if let (Some(before_next_visible), Some(next_visible)) = (maybe_before_next_visible, maybe_next_visible) {
-                let next_clamped = get_viewport_intersection_point(next_visible, before_next_visible);
+                let next_clamped = (self.clamp_fn)(next_visible, before_next_visible);
                 self.next = Some(Visible(next_visible));
                 return Some(FirstVisible(next_clamped));
             }

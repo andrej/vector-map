@@ -83,6 +83,7 @@ enum MouseState {
 struct World {
     yaw: f64,
     pitch: f64,
+    zoom: f64,
     country_outlines: Vec<Vec<CoordGeo>>,
     cur_bounce_direction: BounceDirection,
     proj_3d: SphereProjection,
@@ -93,7 +94,8 @@ struct World {
     latlon_str: String,
     mouse_state: MouseState,
     yaw_speed: f64,
-    pitch_speed: f64
+    pitch_speed: f64,
+    needs_update: bool
 }
 
 impl World {
@@ -103,6 +105,7 @@ impl World {
         Self {
             yaw: yaw,
             pitch: pitch,
+            zoom: 1.0,
             cur_bounce_direction: BounceDirection::BounceUp(0.5),
             proj_3d: SphereProjection,
             proj_2d: OrthogonalProjection::new_from_angles(pitch, yaw),
@@ -113,7 +116,8 @@ impl World {
             latlon_str: String::new(),
             mouse_state: MouseState::MouseUp,
             yaw_speed: 0.1,
-            pitch_speed: 3.0
+            pitch_speed: 3.0,
+            needs_update: false
         }
     }
 }
@@ -124,12 +128,11 @@ impl CanvasRenderLoopState for World
         let t_diff_s = t_diff/1e3;
         let yaw_speed = self.yaw_speed; // [deg/s]
         let pitch_speed = self.pitch_speed; // [deg/s]
-        let mouse_move = if let MouseState::MouseDown = self.mouse_state { true } else { false };
-        if (yaw_speed == 0.0 || pitch_speed == 0.0) && !mouse_move {
+        if (yaw_speed == 0.0 || pitch_speed == 0.0) && !self.needs_update {
             return false;
         }
 
-        if !mouse_move {
+        if !self.needs_update {
             let yaw_inc = yaw_speed * t_diff_s;
             self.yaw = f64::to_radians((f64::to_degrees(self.yaw) - yaw_inc) % 360.0);
             match self.cur_bounce_direction {
@@ -154,6 +157,8 @@ impl CanvasRenderLoopState for World
         self.proj_2d = OrthogonalProjection::new_from_angles(self.pitch, self.yaw);
 
         self.latlon_str = String::from(format!("lat: {:3.3} lon: {:3.3}", f64::to_degrees(self.pitch), f64::to_degrees(self.yaw)));
+
+        self.needs_update = false;
 
         return true;
     }
@@ -250,8 +255,7 @@ fn gen_country_outlines() -> Vec<Vec<CoordGeo>> {
 /// coordinates
 fn project_lines<'a>(
     lines: impl Iterator<Item=impl Iterator<Item=CoordGeo> + 'a> + 'a, 
-    proj_3d: &'a impl Projection<CoordGeo, To=Coord3D>, 
-    proj_2d: &'a OrthogonalProjection,
+    context: &'a World,
     start_op: DrawOp<'a, Coord2D>,
     end_op: DrawOp<'a, Coord2D>,
     draw_arc: bool,
@@ -261,28 +265,33 @@ fn project_lines<'a>(
     -> impl Iterator<Item=DrawOp<'a, Coord2D>> + 'a
 {
     // TODO: move below transforms into World struct
-    let scale_fac = f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
+    let scale_fac = context.zoom * f64::min(canvas_width*0.8/2.0, canvas_height*0.8/2.0);
     let scale = Scale2D { x: scale_fac, y: scale_fac };
     let translate = Translate2D { x: canvas_width/2.0, y: canvas_height/2.0 };
 
     lines.filter_map(move |line| {
         let projected = into_clamped_iter(line.map(move |point| {
-            proj_2d.project(&proj_3d.project(&point))
+            context.proj_2d.project(&context.proj_3d.project(&point))
         }));
         // TODO: move arc_center, arc_radius to be applied when we apply the scale and translate transforms below;
         // the clampedArcIterator really should just return arcs with center at 0.0 and radius 1 or something like that
-        let mut draw_op_gen = 
-            ClampedArcIterator::new(
-                //ClampedIterator::new(
-                    ClampedIterator::new(projected, |p| { p.x <= 0.0 })
-                //, |p| { f64::abs(p.y) < 0.5 && f64::abs(p.z) < 0.5 })
-                //.map(|x| { console_log!("{:?}", x); x})
-                , 
-                draw_arc, //draw_arc,
-                Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
-                scale_fac
-            )
-            //.map(|x| {  console_log!("{:?}", x); x})
+        let mut draw_op_gen: Box<dyn Iterator<Item=DrawOp<Coord2D>>> = 
+            if context.zoom < 2.0 {
+                Box::new(ClampedArcIterator::new(
+                    ClampedIterator::new(projected, |p| { p.x <= 0.0 }, geometry::get_viewport_intersection_point), 
+                    draw_arc,
+                    Coord2D { x: canvas_width/2.0, y: canvas_height/2.0 },
+                    scale_fac
+                ))
+            } else {
+                let zoom = context.zoom;
+                Box::new(ClampedArcIterator::new(
+                    ClampedIterator::new(projected, move |p| { p.x <= 0.0 && f64::abs(p.y) < 1.0/zoom && f64::abs(p.z) < 1.0/zoom }, |p1, p2| { p1 }),
+                    false,
+                    Coord2D { x: 0.0, y: 0.0 },
+                    1.0
+                ))
+            }
         ;
         let first_point = draw_op_gen.next();
         if let Some(mut first_point) = first_point {
@@ -334,8 +343,7 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
     //let debug_points = project_lines(std::iter::once(DEBUG_POINTS.iter().cloned()), &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
     let debug_shapes = project_lines(
         DEBUG_SHAPES.iter().map(|s| { s.iter().cloned() }), 
-        &context.proj_3d, 
-        &context.proj_2d, 
+        context, 
         DrawOp::BeginPath, 
         DrawOp::Fill(context.country_outlines_fill_style.to_string()), 
         true, 
@@ -344,9 +352,9 @@ fn gen_frame_draw_ops<'a>(context: &'a World, canvas_width: f64, canvas_height: 
     );
 
     // Project all lines
-    let lat_lines = project_lines(lat_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    let lon_lines = project_lines(lon_lines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
-    let country_outlines = project_lines(country_outlines, &context.proj_3d, &context.proj_2d, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
+    let lat_lines = project_lines(lat_lines, context, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let lon_lines = project_lines(lon_lines, context, DrawOp::BeginPath, DrawOp::Stroke(context.latlon_stroke_style.to_string()), false, canvas_width, canvas_height);
+    let country_outlines = project_lines(country_outlines, context, DrawOp::BeginPath, DrawOp::Fill(context.country_outlines_fill_style.to_string()), true, canvas_width, canvas_height);
 
     Some(
         std::iter::once(DrawOp::BeginPath)
@@ -406,10 +414,16 @@ pub fn main() {
             let dy = me.movement_y();
             w.yaw -= (-dx as f64)*PI/400.0;
             w.pitch -= (dy as f64)*PI/400.0;
+            w.needs_update = true;
         }
     });
     add_leaky_event_listener_with_state(&draw_loop, "mouseup", move |w: &mut World, e: web_sys::Event| {
         w.mouse_state = MouseState::MouseUp;
+    });
+    add_leaky_event_listener_with_state(&draw_loop, "wheel", move |w: &mut World, e: web_sys::Event| {
+        let we : web_sys::WheelEvent = e.unchecked_into();
+        w.zoom += f64::signum(we.delta_y()) * 0.1;
+        w.needs_update = true;
     });
 
 }

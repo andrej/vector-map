@@ -154,17 +154,12 @@ pub struct OrthogonalProjection {
 
 impl OrthogonalProjection {
     pub fn new(x_axis: Coord3D, y_axis: Coord3D) -> OrthogonalProjection {
-        //let x_axis = normalize(&x_axis);
-        //let y_axis = normalize(&y_axis);
-        //OrthogonalProjection {
-        //    x_axis: x_axis,
-        //    y_axis: y_axis,
-        //    z_axis: cross_product(&x_axis, &y_axis)
-        //}
+        let x_axis = normalize(&x_axis);
+        let y_axis = normalize(&y_axis);
         OrthogonalProjection {
-            x_axis: Coord3D { x: 0.0, y: 1.0, z: 0.0 },
-            y_axis: Coord3D { x: 0.0, y: 0.0, z: 1.0 },
-            z_axis: Coord3D { x: 1.0, y: 0.0, z: 0.0 },
+            x_axis: x_axis,
+            y_axis: y_axis,
+            z_axis: cross_product(&x_axis, &y_axis)
         }
     }
 
@@ -208,22 +203,59 @@ impl OrthogonalProjection {
     
 
     pub fn new_from_angles(latitude: f64, longitude: f64) -> OrthogonalProjection {
+        //assert!(f64::abs(latitude) < std::f64::consts::PI/2.0);
+        //assert!(f64::abs(longitude) < std::f64::consts::PI);
+        //let x_axis = normalize(&Coord3D {
+        //    x: f64::cos(longitude) * f64::cos(latitude),
+        //    y: f64::sin(longitude) * f64::cos(latitude),
+        //    z: f64::sin(latitude)
+        //});
+        //let y_axis = normalize(&Coord3D {
+        //    x: f64::cos(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
+        //    y: f64::sin(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
+        //    z: f64::sin(latitude)
+        //});
+        //let z_axis = cross_product(&x_axis, &y_axis);
+        //let x_axis = Coord3D {
+        //    x: f64::cos(latitude) * f64::cos(longitude),
+        //    y: f64::sin(longitude),
+        //    z: -f64::sin(latitude) * f64::cos(longitude)
+        //};
+        //let y_axis = Coord3D {
+        //    x: -f64::cos(latitude) * f64::sin(longitude),
+        //    y: f64::cos(longitude),
+        //    z: f64::sin(latitude) * f64::sin(longitude)
+        //};
+        //let z_axis = Coord3D {
+        //    x: f64::sin(latitude),
+        //    y: 0.0,
+        //    z: f64::cos(latitude)
+        //};
         let x_axis = Coord3D {
-            x: f64::cos(longitude) * f64::cos(latitude),
-            y: f64::sin(longitude) * f64::cos(latitude),
-            z: f64::sin(latitude)
+            x: f64::cos(longitude) * f64::cos(-latitude),
+            y: f64::sin(longitude) * f64::cos(-latitude),
+            z: -f64::sin(-latitude)
         };
         let y_axis = Coord3D {
-            x: f64::cos(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
-            y: f64::sin(longitude + f64::to_radians(90.0)) * f64::cos(latitude),
-            z: f64::sin(latitude)
+            x: -f64::sin(longitude),
+            y: f64::cos(longitude),
+            z: 0.0
         };
-        let z_axis = cross_product(&x_axis, &y_axis);
+        let z_axis = Coord3D {
+            x: f64::cos(longitude) * f64::sin(-latitude),
+            y: f64::sin(longitude) * f64::sin(-latitude),
+            z: f64::cos(-latitude)
+        };
         OrthogonalProjection {
             x_axis: x_axis,
             y_axis: y_axis,
             z_axis: z_axis
         }
+        //Self::new_from_normal(Coord3D {
+        //    x: f64::cos(longitude) * f64::cos(latitude),
+        //    y: f64::sin(longitude) * f64::cos(latitude),
+        //    z: f64::sin(latitude)
+        //})
     }
 }
 

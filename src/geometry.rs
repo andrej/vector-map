@@ -10,15 +10,18 @@ use crate::DrawOp;
 #[derive(Copy, Clone, Debug)]
 pub struct CoordGeo {
     pub latitude: f64,
-    pub longitude: f64
+    pub longitude: f64,
 }
 
 impl fmt::Display for CoordGeo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{{ latitude: {}, longitude: {} }}", self.latitude, self.longitude)
+        write!(
+            f,
+            "{{ latitude: {}, longitude: {} }}",
+            self.latitude, self.longitude
+        )
     }
 }
-
 
 // --------------------------------------------------------------------------
 // Coord3D
@@ -27,7 +30,7 @@ impl fmt::Display for CoordGeo {
 pub struct Coord3D {
     pub x: f64,
     pub y: f64,
-    pub z: f64
+    pub z: f64,
 }
 
 impl ops::Sub<&Coord3D> for &Coord3D {
@@ -37,7 +40,7 @@ impl ops::Sub<&Coord3D> for &Coord3D {
         Coord3D {
             x: self.x - rhs.x,
             y: self.y - rhs.y,
-            z: self.z - rhs.z
+            z: self.z - rhs.z,
         }
     }
 }
@@ -49,7 +52,7 @@ impl ops::Mul<f64> for &Coord3D {
         Coord3D {
             x: self.x * rhs,
             y: self.y * rhs,
-            z: self.z * rhs
+            z: self.z * rhs,
         }
     }
 }
@@ -63,28 +66,32 @@ impl fmt::Display for Coord3D {
 // TODO: Implement the following as methods on the struct?
 
 fn dot_product(a: &Coord3D, b: &Coord3D) -> f64 {
-    a.x*b.x + a.y*b.y + a.z*b.z
+    a.x * b.x + a.y * b.y + a.z * b.z
 }
 
 fn norm(a: &Coord3D) -> f64 {
-    f64::sqrt(a.x*a.x + a.y*a.y + a.z*a.z)
+    f64::sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
 }
 
 fn normalize(a: &Coord3D) -> Coord3D {
     let norm = norm(a);
-    Coord3D { x: a.x/norm, y: a.y/norm, z: a.z/norm }
+    Coord3D {
+        x: a.x / norm,
+        y: a.y / norm,
+        z: a.z / norm,
+    }
 }
 
 fn cross_product(a: &Coord3D, b: &Coord3D) -> Coord3D {
     Coord3D {
         x: a.y * b.z - a.z * b.y,
         y: a.z * b.x - a.x * b.z,
-        z: a.x * b.y - a.y * b.x
+        z: a.x * b.y - a.y * b.x,
     }
 }
 
 fn project_onto_plane(plane_normal: &Coord3D, vector: &Coord3D) -> Coord3D {
-    // Intuition: dot product `vector`*`plane_normal` gives the component of 
+    // Intuition: dot product `vector`*`plane_normal` gives the component of
     // `vector` in the `plane_normal` direction (i.e. if they are parallel,
     // this gives all of `vector`).
     // By subtracting everything in this direction, which is the normal of the
@@ -93,14 +100,13 @@ fn project_onto_plane(plane_normal: &Coord3D, vector: &Coord3D) -> Coord3D {
     vector - &(&plane_normal * dot_product(vector, &plane_normal))
 }
 
-
 // --------------------------------------------------------------------------
 // Coord2D
 
 #[derive(Copy, Clone, Debug)]
 pub struct Coord2D {
     pub x: f64,
-    pub y: f64
+    pub y: f64,
 }
 
 impl fmt::Display for Coord2D {
@@ -108,7 +114,6 @@ impl fmt::Display for Coord2D {
         write!(f, "{{ x: {}, y: {}}}", self.x, self.y)
     }
 }
-
 
 // --------------------------------------------------------------------------
 // Projection
@@ -122,21 +127,27 @@ pub struct SphereProjection;
 
 impl Projection<CoordGeo> for SphereProjection {
     type To = Coord3D;
-    fn project(&self, &CoordGeo { latitude: lat, longitude: lon}: &CoordGeo) -> Coord3D {
+    fn project(
+        &self,
+        &CoordGeo {
+            latitude: lat,
+            longitude: lon,
+        }: &CoordGeo,
+    ) -> Coord3D {
         let r = 1.0;
         // Positive longitudes are EAST of meridian
         // Positive latitudes are NORTH of the equator
-        Coord3D { 
+        Coord3D {
             x: r * f64::cos(-lon) * f64::cos(lat),
             y: r * f64::sin(-lon) * f64::cos(lat),
-            z: r * f64::sin(lat) 
+            z: r * f64::sin(lat),
         }
     }
 }
 
 impl Projection<Coord3D> for SphereProjection {
     type To = CoordGeo;
-    fn project(&self, Coord3D{ x, y, z}: &Coord3D) -> CoordGeo {
+    fn project(&self, Coord3D { x, y, z }: &Coord3D) -> CoordGeo {
         let r = 1.0;
         //let longitude = f64::signum(*y) * (f64::atan(f64::abs(*y)/f64::abs(*x)) + if *x < 0.0 { f64::to_radians(90.0) } else { 0.0 } );
         CoordGeo {
@@ -149,7 +160,7 @@ impl Projection<Coord3D> for SphereProjection {
 pub struct OrthogonalProjection {
     x_axis: Coord3D,
     y_axis: Coord3D,
-    z_axis: Coord3D
+    z_axis: Coord3D,
 }
 
 impl OrthogonalProjection {
@@ -159,7 +170,7 @@ impl OrthogonalProjection {
         OrthogonalProjection {
             x_axis: x_axis,
             y_axis: y_axis,
-            z_axis: cross_product(&x_axis, &y_axis)
+            z_axis: cross_product(&x_axis, &y_axis),
         }
     }
 
@@ -184,13 +195,13 @@ impl OrthogonalProjection {
             Coord3D {
                 x: 0.0,
                 y: 1.0,
-                z: 0.0
+                z: 0.0,
             }
         } else {
             Coord3D {
                 x: 0.0,
                 y: 0.0,
-                z: 1.0
+                z: 1.0,
             }
         };
         // Project it onto the plane normal to `normal`
@@ -200,7 +211,6 @@ impl OrthogonalProjection {
         let x_axis = cross_product(&normal, &y_axis);
         OrthogonalProjection::new(x_axis, y_axis)
     }
-    
 
     pub fn new_from_angles(latitude: f64, longitude: f64) -> OrthogonalProjection {
         //assert!(f64::abs(latitude) < std::f64::consts::PI/2.0);
@@ -234,22 +244,22 @@ impl OrthogonalProjection {
         let x_axis = Coord3D {
             x: f64::cos(longitude) * f64::cos(-latitude),
             y: f64::sin(longitude) * f64::cos(-latitude),
-            z: -f64::sin(-latitude)
+            z: -f64::sin(-latitude),
         };
         let y_axis = Coord3D {
             x: -f64::sin(longitude),
             y: f64::cos(longitude),
-            z: 0.0
+            z: 0.0,
         };
         let z_axis = Coord3D {
             x: f64::cos(longitude) * f64::sin(-latitude),
             y: f64::sin(longitude) * f64::sin(-latitude),
-            z: f64::cos(-latitude)
+            z: f64::cos(-latitude),
         };
         OrthogonalProjection {
             x_axis: x_axis,
             y_axis: y_axis,
-            z_axis: z_axis
+            z_axis: z_axis,
         }
         //Self::new_from_normal(Coord3D {
         //    x: f64::cos(longitude) * f64::cos(latitude),
@@ -259,15 +269,14 @@ impl OrthogonalProjection {
     }
 }
 
-
 impl Projection<Coord3D> for OrthogonalProjection {
     type To = Coord3D;
 
     fn project(&self, input: &Coord3D) -> Coord3D {
-        Coord3D { 
-            x: dot_product(&input, &self.x_axis), 
+        Coord3D {
+            x: dot_product(&input, &self.x_axis),
             y: dot_product(&input, &self.y_axis),
-            z: dot_product(&input, &self.z_axis)
+            z: dot_product(&input, &self.z_axis),
         }
     }
 }
@@ -283,21 +292,22 @@ pub fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coo
     // sgn needs to be -1 if we are in the left hemisphere, +1 if in the right
     // (i.e. we will clamp the longitude to -90 deg or +90 deg)
     // if I have to increase the longitude to get from inside_rev to outside_rev
-    // on the shortest path, it's in the left hemisphere; if I have to decrease 
+    // on the shortest path, it's in the left hemisphere; if I have to decrease
     // the longitude, it's in the right
     if lon_diff > std::f64::consts::PI || lon_diff < -std::f64::consts::PI {
         lon_diff = -(lon_diff - std::f64::consts::PI);
     }
     let sgn = f64::signum(-lon_diff);
-    let lat_slope = (outside_rev.latitude - inside_rev.latitude) / (outside_rev.longitude - inside_rev.longitude);
+    let lat_slope = (outside_rev.latitude - inside_rev.latitude)
+        / (outside_rev.longitude - inside_rev.longitude);
     let lon = sgn * f64::to_radians(90.0);
     let edge_rev = CoordGeo {
         longitude: lon,
-        latitude: (inside_rev.latitude + lat_slope * (lon - inside_rev.longitude))
+        latitude: (inside_rev.latitude + lat_slope * (lon - inside_rev.longitude)),
     };
     let sphere_proj = SphereProjection;
     let mut edge = sphere_proj.project(&edge_rev);
-    // due to floating point inaccuracies, x might be a very small positive 
+    // due to floating point inaccuracies, x might be a very small positive
     // number at this point, even though we just chose a point that should be
     // the last visible point. To make sure it doesn't get culled, set it to
     // 0.0, because that is the accurate solution.
@@ -305,55 +315,58 @@ pub fn get_viewport_intersection_point(inside: Coord3D, outside: Coord3D) -> Coo
     edge
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub enum ClampedIteratorPoint {
     /// This point is visible, and the points before and after it (if any) are
     /// also visible.
-    Visible(Coord3D), 
+    Visible(Coord3D),
     /// This point is the last visible point before the shape leaves the
     /// viewport. It is likely the result of clamping the intersection of a
     /// visible point in the input iterator and its following invisible point.
     LastVisible(Coord3D),
     /// This point is the first visible point after previous points of the
     /// shape were outside the viewport.
-    FirstVisible(Coord3D)
-    // Note that if we have a viewport that is alrger than zero (which we 
-    // assume) we cannot have a point that is both FirstVisible *and* 
-    // LastVisible, as those points would be clamped to the respective edges of
-    // the viewport. We also assume that we don't have lines that go 
-    // from point A to point B to point A, where A is outside of the viewport
-    // and B is inside, and we assume no point lies exactly on the boundary of
-    // the viewport.
+    FirstVisible(Coord3D), // Note that if we have a viewport that is alrger than zero (which we
+                           // assume) we cannot have a point that is both FirstVisible *and*
+                           // LastVisible, as those points would be clamped to the respective edges of
+                           // the viewport. We also assume that we don't have lines that go
+                           // from point A to point B to point A, where A is outside of the viewport
+                           // and B is inside, and we assume no point lies exactly on the boundary of
+                           // the viewport.
 }
 
 impl ClampedIteratorPoint {
     fn get_coord(&self) -> &Coord3D {
         match self {
-            Self::Visible(x) | Self::LastVisible(x) | Self::FirstVisible(x) => { x }
+            Self::Visible(x) | Self::LastVisible(x) | Self::FirstVisible(x) => x,
         }
     }
 }
 
-pub fn into_clamped_iter(iter: impl Iterator<Item=Coord3D>) -> impl Iterator<Item=ClampedIteratorPoint> {
+pub fn into_clamped_iter(
+    iter: impl Iterator<Item = Coord3D>,
+) -> impl Iterator<Item = ClampedIteratorPoint> {
     iter.map(|point| ClampedIteratorPoint::Visible(point))
 }
 
 pub struct ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
-where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool,
-ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+    IsVisibleFnT: Fn(Coord3D) -> bool,
+    ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D,
 {
     iter: InputIter,
     next: Option<ClampedIteratorPoint>,
     after_next: Option<ClampedIteratorPoint>,
     is_visible_fn: IsVisibleFnT,
-    clamp_fn: ClampFnT
+    clamp_fn: ClampFnT,
 }
 
 impl<InputIter, IsVisibleFnT, ClampFnT> ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
-where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool,
-ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+    IsVisibleFnT: Fn(Coord3D) -> bool,
+    ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D,
 {
     pub fn new(mut iter: InputIter, is_visible_fn: IsVisibleFnT, clamp_fn: ClampFnT) -> Self {
         Self {
@@ -361,31 +374,33 @@ ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D
             next: Option::None,
             after_next: Option::None,
             is_visible_fn: is_visible_fn,
-            clamp_fn: clamp_fn
+            clamp_fn: clamp_fn,
         }
     }
 }
 
-impl<InputIter, IsVisibleFnT, ClampFnT> Iterator for ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
-where InputIter: Iterator<Item=ClampedIteratorPoint>,
-IsVisibleFnT: Fn(Coord3D) -> bool,
-ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
+impl<InputIter, IsVisibleFnT, ClampFnT> Iterator
+    for ClampedIterator<InputIter, IsVisibleFnT, ClampFnT>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+    IsVisibleFnT: Fn(Coord3D) -> bool,
+    ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D,
+{
     type Item = ClampedIteratorPoint;
     fn next(&mut self) -> Option<ClampedIteratorPoint> {
-
         use ClampedIteratorPoint::*;
         let current = match self.next.clone() {
             Some(LastVisible(p)) => {
                 // return LastVisibles immediately; we start fresh after this
                 self.next = self.after_next.clone();
                 self.after_next = None;
-                return Some(LastVisible(p))
-            },
+                return Some(LastVisible(p));
+            }
             Some(Visible(p)) | Some(FirstVisible(p)) => {
                 self.next = self.after_next.clone();
                 self.after_next = None;
                 p
-            },
+            }
             None => match self.iter.next() {
                 None => return None,
                 // FIXME below code is literally copy pasted ...
@@ -393,20 +408,20 @@ ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
                     // return LastVisibles immediately; we start fresh after this
                     self.next = self.after_next.clone();
                     self.after_next = None;
-                    return Some(LastVisible(p))
-                },
+                    return Some(LastVisible(p));
+                }
                 Some(Visible(p)) | Some(FirstVisible(p)) => {
                     self.next = self.after_next.clone();
                     self.after_next = None;
                     p
-                },
-            }
+                }
+            },
         };
-        
+
         if (self.is_visible_fn)(current) {
             // current is visible
             let maybe_next = self.iter.next();
-            if let Some(next) = maybe_next { 
+            if let Some(next) = maybe_next {
                 let next = next.get_coord();
                 if !(self.is_visible_fn)(*next) {
                     // next is invisible; clamp and enqueue it as LastVisible
@@ -423,7 +438,6 @@ ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
             }
             // Return this point as regular Visible
             return Some(Visible(current));
-
         } else {
             // current invisible
             // find next visible
@@ -438,8 +452,13 @@ ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
                 }
                 maybe_before_next_visible = Some(*next_visible);
             }
-            assert!(maybe_next_visible.is_some() && maybe_before_next_visible.is_some() || !maybe_next_visible.is_some());
-            if let (Some(before_next_visible), Some(next_visible)) = (maybe_before_next_visible, maybe_next_visible) {
+            assert!(
+                maybe_next_visible.is_some() && maybe_before_next_visible.is_some()
+                    || !maybe_next_visible.is_some()
+            );
+            if let (Some(before_next_visible), Some(next_visible)) =
+                (maybe_before_next_visible, maybe_next_visible)
+            {
                 let next_clamped = (self.clamp_fn)(next_visible, before_next_visible);
                 self.next = Some(Visible(next_visible));
                 return Some(FirstVisible(next_clamped));
@@ -447,12 +466,14 @@ ClampFnT: Fn(Coord3D, Coord3D) -> Coord3D {
         }
 
         // input iterator exhausted
-        return Option::None
+        return Option::None;
     }
 }
 
 pub struct ClampedArcIterator<'a, InputIter>
-where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint> + 'a,
+{
     iter: InputIter,
     a: Option<ClampedIteratorPoint>,
     b: Option<ClampedIteratorPoint>,
@@ -460,11 +481,13 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
     draw_arc: bool,
     arc_center: Coord2D,
     arc_radius: f64,
-    _phantom: std::marker::PhantomData<&'a InputIter>
+    _phantom: std::marker::PhantomData<&'a InputIter>,
 }
 
 impl<'a, InputIter> ClampedArcIterator<'a, InputIter>
-where InputIter: Iterator<Item=ClampedIteratorPoint> {
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
     pub fn new(mut iter: InputIter, draw_arc: bool, arc_center: Coord2D, arc_radius: f64) -> Self {
         let first = iter.next();
         Self {
@@ -475,19 +498,25 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> {
             draw_arc: draw_arc,
             arc_center: arc_center,
             arc_radius: arc_radius,
-            _phantom: std::marker::PhantomData
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
 impl<'a, InputIter> Iterator for ClampedArcIterator<'a, InputIter>
-where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint> + 'a,
+{
     type Item = DrawOp<'a, Coord2D>;
     fn next(&mut self) -> Option<DrawOp<'a, Coord2D>> {
         use ClampedIteratorPoint::*;
         let next = match self.iter.next() {
-            p@Some(_) => p,
-            None => { let p = self.first.clone(); self.first = None; p }
+            p @ Some(_) => p,
+            None => {
+                let p = self.first.clone();
+                self.first = None;
+                p
+            }
         };
         let a = self.a.clone();
         let b = self.b.clone();
@@ -502,18 +531,23 @@ where InputIter: Iterator<Item=ClampedIteratorPoint> + 'a {
                     use std::f64::consts::PI;
                     let angle_a = f64::atan2(ay, ax);
                     let angle_b = f64::atan2(by, bx);
-                    let angle_diff = (angle_b - angle_a + 2.0*PI) % (2.0*PI);
-                    Some(DrawOp::Arc(self.arc_center, self.arc_radius, angle_a, angle_b, angle_diff>PI))
+                    let angle_diff = (angle_b - angle_a + 2.0 * PI) % (2.0 * PI);
+                    Some(DrawOp::Arc(
+                        self.arc_center,
+                        self.arc_radius,
+                        angle_a,
+                        angle_b,
+                        angle_diff > PI,
+                    ))
                 } else {
                     Some(DrawOp::MoveTo(Coord2D { x: b.y, y: -b.z }))
                 }
-            },
-            (_, Some(FirstVisible(p))) 
-                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z })),
-            (_, Some(Visible(p)))  |
-            (_, Some(LastVisible(p))) 
-                => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z })),
-            (_, None) => None
+            }
+            (_, Some(FirstVisible(p))) => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z })),
+            (_, Some(Visible(p))) | (_, Some(LastVisible(p))) => {
+                Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z }))
+            }
+            (_, None) => None,
         }
     }
 }
@@ -531,23 +565,29 @@ pub trait Transform<CoordType> {
 #[derive(Copy, Clone)]
 pub struct Translate2D {
     pub x: f64,
-    pub y: f64   
+    pub y: f64,
 }
 
 impl Transform<Coord2D> for Translate2D {
     fn transform(&self, input: &Coord2D) -> Coord2D {
-        Coord2D { x: input.x + self.x, y: input.y + self.y }
+        Coord2D {
+            x: input.x + self.x,
+            y: input.y + self.y,
+        }
     }
 }
 
 #[derive(Copy, Clone)]
 pub struct Scale2D {
     pub x: f64,
-    pub y: f64
+    pub y: f64,
 }
 
 impl Transform<Coord2D> for Scale2D {
     fn transform(&self, input: &Coord2D) -> Coord2D {
-        Coord2D { x: input.x * self.x, y: input.y * self.y }
+        Coord2D {
+            x: input.x * self.x,
+            y: input.y * self.y,
+        }
     }
 }

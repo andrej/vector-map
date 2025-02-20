@@ -470,9 +470,44 @@ where
     }
 }
 
-pub struct ClampedArcIterator<'a, InputIter>
+pub struct ClampedLineIterator<InputIter>
 where
-    InputIter: Iterator<Item = ClampedIteratorPoint> + 'a,
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
+    iter: InputIter,
+}
+
+impl<InputIter> ClampedLineIterator<InputIter>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
+    pub fn new(mut iter: InputIter) -> Self {
+        Self { iter }
+    }
+}
+
+impl<InputIter> Iterator for ClampedLineIterator<InputIter>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
+    type Item = DrawOp<'static, Coord2D>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter.next() {
+            None => None,
+            Some(clamped) => {
+                let point = clamped.get_coord();
+                Some(DrawOp::LineTo(Coord2D {
+                    x: point.y,
+                    y: -point.z,
+                }))
+            }
+        }
+    }
+}
+
+pub struct ClampedArcIterator<InputIter>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
     iter: InputIter,
     a: Option<ClampedIteratorPoint>,
@@ -481,10 +516,9 @@ where
     draw_arc: bool,
     arc_center: Coord2D,
     arc_radius: f64,
-    _phantom: std::marker::PhantomData<&'a InputIter>,
 }
 
-impl<'a, InputIter> ClampedArcIterator<'a, InputIter>
+impl<InputIter> ClampedArcIterator<InputIter>
 where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
@@ -498,17 +532,19 @@ where
             draw_arc: draw_arc,
             arc_center: arc_center,
             arc_radius: arc_radius,
-            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<'a, InputIter> Iterator for ClampedArcIterator<'a, InputIter>
+impl<InputIter> Iterator for ClampedArcIterator<InputIter>
 where
-    InputIter: Iterator<Item = ClampedIteratorPoint> + 'a,
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
-    type Item = DrawOp<'a, Coord2D>;
-    fn next(&mut self) -> Option<DrawOp<'a, Coord2D>> {
+    // We can use a static lifetime for DrawOps because we actually do not emit
+    // any of the enum values for DrawOp that contain a reference anywhere in
+    // this impl
+    type Item = DrawOp<'static, Coord2D>;
+    fn next(&mut self) -> Option<DrawOp<'static, Coord2D>> {
         use ClampedIteratorPoint::*;
         let next = match self.iter.next() {
             p @ Some(_) => p,

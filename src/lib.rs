@@ -326,18 +326,30 @@ fn project_lines<'a>(
                     scale_fac,
                 ))
             } else {
-                let zoom = context.zoom;
-                Box::new(ClampedArcIterator::new(
+                let limit = 1.0 / context.zoom;
+                Box::new(ClampedLineIterator::new(
                     ClampedIterator::new(
                         projected,
                         move |p| {
-                            p.x <= 0.0 && f64::abs(p.y) < 1.0 / zoom && f64::abs(p.z) < 1.0 / zoom
+                            p.x <= 0.0 && f64::abs(p.y) < limit && f64::abs(p.z) < limit
                         },
-                        |p1, p2| p1,
-                    ),
-                    false,
-                    Coord2D { x: 0.0, y: 0.0 },
-                    1.0,
+                        move |visible, invisible| {
+                            let dx = invisible.x - visible.x;
+                            let dy = invisible.y - visible.y;
+                            let dz = invisible.z - visible.z;
+                            // TODO: handle case where dy or dz are zero to avoid division by zero
+                            let dist = if f64::abs(invisible.y) >= limit {
+                                (f64::signum(invisible.y) * limit - visible.y) / dy
+                            } else {
+                                (f64::signum(invisible.z) * limit - visible.z) / dz
+                            };
+                            Coord3D {
+                                x: visible.x + dist * dx,
+                                y: visible.y + dist * dy,
+                                z: visible.z + dist * dz
+                            }
+                        },
+                    )
                 ))
             };
             let first_point = draw_op_gen.next();

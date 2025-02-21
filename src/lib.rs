@@ -349,7 +349,8 @@ fn project_lines<'a>(
                                 z: visible.z + dist * dz
                             }
                         },
-                    )
+                    ),
+                    Coord3D { x: limit, y: limit, z: limit}
                 ))
             };
             let first_point = draw_op_gen.next();

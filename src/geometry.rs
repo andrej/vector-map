@@ -475,14 +475,26 @@ where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
     iter: InputIter,
+    first: Option<ClampedIteratorPoint>,  // used to repeat the first point of the iterator again at the end
+    a: Option<ClampedIteratorPoint>,
+    b: Option<ClampedIteratorPoint>,
+    limit: Coord3D
 }
 
 impl<InputIter> ClampedLineIterator<InputIter>
 where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
-    pub fn new(mut iter: InputIter) -> Self {
-        Self { iter }
+    pub fn new(mut iter: InputIter, limit: Coord3D) -> Self {
+        let a = iter.next();
+        let b = iter.next();
+        Self { 
+            iter: iter,
+            first: a.clone(),
+            a: a,
+            b: b,
+            limit: limit  // TODO this really does not belong here, all iterators should just be in range -1.0 and 1.0 and then transforms _afterwards_
+        }
     }
 }
 
@@ -492,15 +504,38 @@ where
 {
     type Item = DrawOp<'static, Coord2D>;
     fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
-            None => None,
-            Some(clamped) => {
-                let point = clamped.get_coord();
-                Some(DrawOp::LineTo(Coord2D {
-                    x: point.y,
-                    y: -point.z,
-                }))
+        use ClampedIteratorPoint::*;
+        let out = |p: &Coord3D| { DrawOp::LineTo(Coord2D { x: p.y, y: -p.z }) };
+        // FIXME: This implementation currently does not handle when we need
+        // two corners, i.e. when clamped points are on opposite ends of the 
+        // viewport, not adjacent edges, e.g.
+        //    ___
+        //  .|   |. 
+        //   |___|
+        let (a, b) = (self.a.clone(), self.b.clone());
+
+        if let (Some(LastVisible(a_p)), Some(FirstVisible(b_p))) | (Some(FirstVisible(a_p)), Some(LastVisible(b_p))) = (&a, &b) {
+            if a_p.x != b_p.x && a_p.y != b_p.y && a_p.z != b_p.z {
+                let corner = Coord3D {
+                    x: self.limit.x * f64::signum(a_p.x),
+                    y: self.limit.y * f64::signum(a_p.y),
+                    z: self.limit.z * f64::signum(b_p.z)
+                };
+                self.a = Some(Visible(corner));
+                return Some(out(&a_p))
             }
+        }
+
+        self.a = self.b.clone();
+        self.b = self.iter.next();
+        if self.b.is_none() {
+            self.b = self.first.clone();
+            self.first = None;
+        }
+        if let Some(a_p) = a {
+            Some(out(a_p.get_coord()))
+        } else {
+            None
         }
     }
 }

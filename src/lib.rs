@@ -289,7 +289,7 @@ fn project_lines<'a>(
     context: &'a World,
     start_op: DrawOp<'a, Coord2D>,
     end_op: DrawOp<'a, Coord2D>,
-    draw_arc: bool,
+    is_closed_shape: bool,
     canvas_width: f64,
     canvas_height: f64,
 ) -> impl Iterator<Item = DrawOp<'a, Coord2D>> + 'a {
@@ -311,14 +311,14 @@ fn project_lines<'a>(
             );
             // TODO: move arc_center, arc_radius to be applied when we apply the scale and translate transforms below;
             // the clampedArcIterator really should just return arcs with center at 0.0 and radius 1 or something like that
-            let mut draw_op_gen: Box<dyn Iterator<Item = DrawOp<Coord2D>>> = if context.zoom < 2.0 {
+            let mut draw_op_gen: Box<dyn Iterator<Item = DrawOp<Coord2D>>> = if context.zoom < 3.0 { // TODO reason about this 3.0 constant
                 Box::new(ClampedArcIterator::new(
                     ClampedIterator::new(
                         projected,
                         |p| p.x <= 0.0,
                         geometry::get_viewport_intersection_point,
                     ),
-                    draw_arc,
+                    is_closed_shape,
                     Coord2D {
                         x: canvas_width / 2.0,
                         y: canvas_height / 2.0,
@@ -327,7 +327,7 @@ fn project_lines<'a>(
                 ))
             } else {
                 let limit = 1.0 / context.zoom;
-                Box::new(ClampedLineIterator::new(
+                let clamped_iter = 
                     ClampedIterator::new(
                         projected,
                         move |p| {
@@ -349,9 +349,12 @@ fn project_lines<'a>(
                                 z: visible.z + dist * dz
                             }
                         },
-                    ),
-                    Coord3D { x: limit, y: limit, z: limit}
-                ))
+                    );
+                if is_closed_shape {
+                    Box::new(ClampedRectIterator::new(clamped_iter, Coord3D { x: limit, y: limit, z: limit}))
+                } else {
+                    Box::new(ClampedLineIterator::new(clamped_iter))
+                }
             };
             let first_point = draw_op_gen.next();
             if let Some(mut first_point) = first_point {

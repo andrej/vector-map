@@ -474,6 +474,37 @@ pub struct ClampedLineIterator<InputIter>
 where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
+    iter: InputIter
+}
+
+impl<InputIter> ClampedLineIterator<InputIter>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
+    pub fn new(mut iter: InputIter) -> Self {
+        Self { iter }
+    }
+}
+
+impl<InputIter> Iterator for ClampedLineIterator<InputIter>
+where 
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
+    type Item = DrawOp<'static, Coord2D>;
+    fn next(&mut self) -> Option<Self::Item> {
+        use ClampedIteratorPoint::*;
+        match self.iter.next() {
+            None => None,
+            Some(FirstVisible(p)) => Some(DrawOp::MoveTo(Coord2D { x: p.y, y: -p.z })),
+            Some(Visible(p)) | Some(LastVisible(p)) => Some(DrawOp::LineTo(Coord2D { x: p.y, y: -p.z }))
+        }
+    }
+}
+
+pub struct ClampedRectIterator<InputIter>
+where
+    InputIter: Iterator<Item = ClampedIteratorPoint>,
+{
     iter: InputIter,
     first: Option<ClampedIteratorPoint>,  // used to repeat the first point of the iterator again at the end
     a: Option<ClampedIteratorPoint>,
@@ -481,7 +512,7 @@ where
     limit: Coord3D
 }
 
-impl<InputIter> ClampedLineIterator<InputIter>
+impl<InputIter> ClampedRectIterator<InputIter>
 where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {
@@ -498,7 +529,7 @@ where
     }
 }
 
-impl<InputIter> Iterator for ClampedLineIterator<InputIter>
+impl<InputIter> Iterator for ClampedRectIterator<InputIter>
 where
     InputIter: Iterator<Item = ClampedIteratorPoint>,
 {

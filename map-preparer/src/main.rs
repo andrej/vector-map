@@ -13,11 +13,25 @@ fn main() -> std::io::Result<()> {
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
     let mut has_something: [[bool; 180]; 360];  
     while let Ok((size, blob_header)) = read_blob_header(&mut buffered_file) {
-        //if n_read > max_n {
-        //    break;
-        //}
-        //println!("Blob {:9}: Type: {}  Size: {}  Header size: {}", n_read, blob_header.r#type, blob_header.datasize, size);
-        buffered_file.seek_relative(blob_header.datasize as i64);
+        if n_read > max_n {
+            break;
+        }
+        println!("Blob {:9}: Type: {}  Size: {}  Header size: {}", n_read, blob_header.r#type, blob_header.datasize, size);
+        if let Ok((size, blob)) = read_blob(&mut buffered_file, &blob_header) {
+            println!("Uncompressed size: {}  Data type: {:?}", blob.raw_size(), blob.data.unwrap());
+            //match blob.data {
+            //    Some(osm::blob::Data::Raw(_)) => {
+            //        println!("raw");
+            //    }
+            //    Some(osm::blob::Data::ZlibData(_)) => {
+            //        println!("zlib data");
+            //    }
+            //    _ => {()}
+            //};
+        } else {
+            println!("error reading blob");
+        }
+        //buffered_file.seek_relative(blob_header.datasize as i64);
         n_read += 1;
     }
     println!("{}", n_read);
@@ -39,6 +53,19 @@ fn read_blob_header(in_stream: &mut impl std::io::Read) -> Result<(usize, osm::B
     //let header = osm::HeaderBlock::decode(&buffer[..])?;
     let blob_header = osm::BlobHeader::decode(&blob_header_buffer as &[u8]).map_err(|e| { OSMPBFParseError::new(e) })?;
     Ok((size, blob_header))
+}
+
+/// Reads a blob
+fn read_blob(in_stream: &mut impl std::io::Read, header: &osm::BlobHeader) -> Result<(usize, osm::Blob), OSMPBFParseError> {
+    let compressed_size = header.datasize.try_into().map_err(OSMPBFParseError::new)?;
+    let mut buffer = vec![0; compressed_size];
+    let read_bytes = std::io::Read::read(in_stream, &mut buffer).map_err(OSMPBFParseError::new)?;
+    if compressed_size != read_bytes {
+        println!("read {} bytes but wanted {}", read_bytes, compressed_size);
+        return Err(OSMPBFParseError { root_cause: None })
+    }
+    let blob = osm::Blob::decode(&buffer as &[u8]).map_err(OSMPBFParseError::new)?;
+    Ok((compressed_size, blob))
 }
 
 struct OSMPBFParseError {

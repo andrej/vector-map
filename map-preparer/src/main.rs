@@ -18,7 +18,7 @@ fn main() -> std::io::Result<()> {
     let mut n_blobs_read = 0;
     let max_n_blobs = 64;
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
-    let mut has_something: [[bool; 180]; 360];  
+    let mut has_something = [[false; 180]; 360];  
     while let Ok((size, blob_header)) = read_blob_header(&mut buffered_file) {
         if n_blobs_read >= max_n_blobs {
             break;
@@ -43,15 +43,19 @@ fn main() -> std::io::Result<()> {
                 let osm_type: String = blob_header.r#type;
                 if osm_type == "OSMHeader" {
                     let header = osm::HeaderBlock::decode(&decompressed as &[u8]).expect("couldn't read header block");
-                    println!("Header: {:?}", header.bbox);
                 } else if osm_type == "OSMData" {
                     // OSM wiki: A primitive block contains _all_ the information to decompress the entities it contains
                     // -> I assume this means any referred IDs in relations/ways will be contained in this block
                     let decoded_data = osm::PrimitiveBlock::decode(&decompressed as &[u8]).expect("couldn't read data block");
                     let string_table: Vec<String> = decoded_data.stringtable.s.iter().map(|str| std::str::from_utf8(&str).expect("invalid string").to_string()).collect();
+                    let lat_offset = decoded_data.lat_offset();
+                    let lon_offset = decoded_data.lon_offset();
+                    let granularity = decoded_data.granularity();
+                    let coord_decode = |coord, offset| -> f64 {
+                        1e-9 * ((offset + (granularity as i64) * coord) as f64)
+                    };
                     // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
                     for group in decoded_data.primitivegroup.iter() {
-                        println!("group");
                         for node in &group.nodes {
                             for (k, v) in node.keys.iter().zip(node.vals.iter()) {
                                 println!("{:?}: {:?}", k, v);
@@ -90,18 +94,19 @@ fn main() -> std::io::Result<()> {
                                         kv.insert(k, v);
                                     }
                                 }
-                                let coord_decode = |coord, last| -> f64 {
-                                    1e-9 * ((coord-last) as f64)
-                                };
-                                let lat = coord_decode(*raw_lat, last_lat);
-                                let lon = coord_decode(*raw_lon, last_lon);
-                                println!("{} {} {:?}", lat, lon, kv);
-                                last_lat = *raw_lat;
-                                last_lon = *raw_lon;
+                                // raw_lat = x_2 - last_lat
+                                // raw_lat + last_lat = x_2
+                                let lat_i = last_lat + *raw_lat;
+                                let lon_i = last_lon + *raw_lon;
+                                let lat = coord_decode(lat_i, lat_offset);
+                                let lon = coord_decode(lon_i, lon_offset);
+                                has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
+                                //println!("{} {} {:?}", lat, lon, kv);
+                                last_lat = lat_i;
+                                last_lon = lon_i;
                             }
                         }
                     }
-                    println!("Granularity: {:?}", decoded_data.granularity());
                 }
             }
         } else {
@@ -111,6 +116,16 @@ fn main() -> std::io::Result<()> {
         n_blobs_read += 1;
     }
     println!("{}", n_blobs_read);
+    for lat_i in 0..180 {
+        for lon_i in 0..360 {
+            if has_something[lon_i][lat_i] {
+                print!("x");
+            } else {
+                print!(" ");
+            }
+        }
+        println!("");
+    }
     Ok(())
 }
 

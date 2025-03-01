@@ -2,7 +2,7 @@
 Keeping track of release build performance:
 
 commit      comment                                 max_n_blobs     time
-            non-streaming, decompress from buffer   64              2.21s
+f794dbdf515 non-streaming, decompress from buffer   64              2.21s
 */
 
 use map_preparer::osm;
@@ -45,7 +45,62 @@ fn main() -> std::io::Result<()> {
                     let header = osm::HeaderBlock::decode(&decompressed as &[u8]).expect("couldn't read header block");
                     println!("Header: {:?}", header.bbox);
                 } else if osm_type == "OSMData" {
+                    // OSM wiki: A primitive block contains _all_ the information to decompress the entities it contains
+                    // -> I assume this means any referred IDs in relations/ways will be contained in this block
                     let decoded_data = osm::PrimitiveBlock::decode(&decompressed as &[u8]).expect("couldn't read data block");
+                    let string_table: Vec<String> = decoded_data.stringtable.s.iter().map(|str| std::str::from_utf8(&str).expect("invalid string").to_string()).collect();
+                    // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
+                    for group in decoded_data.primitivegroup.iter() {
+                        println!("group");
+                        for node in &group.nodes {
+                            for (k, v) in node.keys.iter().zip(node.vals.iter()) {
+                                println!("{:?}: {:?}", k, v);
+                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                            }
+                        }
+                        for way in &group.ways {
+                            for (k, v) in way.keys.iter().zip(way.vals.iter()) {
+                                println!("{:?}: {:?}", k, v);
+                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                            }
+                        }
+                        for relation in &group.relations {
+                            for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
+                                println!("{:?}: {:?}", k, v);
+                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                            }
+                        }
+                        if let Some(dense_nodes) = &group.dense {
+                            let mut kv_iter = dense_nodes.keys_vals.iter();
+                            let has_kv = dense_nodes.keys_vals.len() > 0;
+                            let mut last_lat: i64 = 0;
+                            let mut last_lon: i64 = 0;
+                            for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
+                                // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
+                                // Each node's tags are encoded in alternating <keyid> <valid>
+                                // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
+                                let mut kv = std::collections::HashMap::<&String, &String>::new();
+                                if has_kv {
+                                    while let Some(k) = kv_iter.next() {
+                                        if *k == 0 {
+                                            break;
+                                        }
+                                        let k = &string_table[*k as usize];
+                                        let v = &string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
+                                        kv.insert(k, v);
+                                    }
+                                }
+                                let coord_decode = |coord, last| -> f64 {
+                                    1e-9 * ((coord-last) as f64)
+                                };
+                                let lat = coord_decode(*raw_lat, last_lat);
+                                let lon = coord_decode(*raw_lon, last_lon);
+                                println!("{} {} {:?}", lat, lon, kv);
+                                last_lat = *raw_lat;
+                                last_lon = *raw_lon;
+                            }
+                        }
+                    }
                     println!("Granularity: {:?}", decoded_data.granularity());
                 }
             }

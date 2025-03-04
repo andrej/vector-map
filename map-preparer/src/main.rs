@@ -2,13 +2,74 @@
 Keeping track of release build performance:
 
 commit      comment                                 max_n_blobs     time
-f794dbdf515 non-streaming, decompress from buffer   64              2.21s
+f794dbdf515 non-streaming, decompress from buffer   64              2.21 s
+3d9ad8b     decode dense nodes, map latlon          64              2.69 s
+*/
+
+/*
+Plan:
+
+ - streaming decoder
+   - reads minimum number of bytes needed from input stream on demand
+   - decompresses minimum number of bytes to read next item (i.e. read header
+     first to determine how much to read, then only read length indicated in 
+     header, etc.)
+   - yields:
+     - GroupStart bbox
+     - Node
+     - RelationStart
+       - NodeRef
+     - RelationEnd
+     - WayStart
+       - NodeRef
+     - WayEnd
+     - GroupEnd
+     - in that sequence
+
+ - hashmap of merged nodes:
+   nodes that are within same granularity for current zoom level become merged
+   to just one of their ids;
+   even better, just use lat/lon tuple at selected zoom granularity as the ID;
+   all properties become merged to that lat/lon at the zoom level
+   -> basically binning of lat/lons for given zoom level (don't need higher 
+      accuracy than what could be displayed in one pixel at given zoom level)
+   -> at outermost zoom level, returned data should contain whole globe at a
+      rough granularity
+   -> at closer zoom levels, have multiple tiles; need to perform clamping
+
+ - final target output:
+   relations, ways arrays for each tile and zoom level we intend to support
+   relations and ways should be separated out by some search criteria, e.g. 
+   type=highway for efficient access
+
+   way(type=highway) = {metadata, [(lat, lon), (lat, lon), (lat, lon) ...]} <- make lat lon i16s so 4 bytes for each tuple
+   relation(type=highway) = {metadata, }
+
+ - parallelization: parallel threads operate on different subsections of the
+   input file / different start offsets. challenge: need to read some of the
+   file to start at a sensible place (i.e. start at a primitive block);
+   each thread produces its own outputs; finally, the outputs must be merged
+   together; could potentially also parallelize the merging phase: parallel
+   threads for each output to be produced
 */
 
 use map_preparer::osm;
 use prost::Message;
 
 const BUFFER_SIZE: usize = 4096;
+
+/// lat, lon are in radians; returned values are x y where (0, 0) is in the top left corner
+/// see: https://en.wikipedia.org/wiki/Web_Mercator_projection
+fn web_mercator(lat: f64, lon: f64) -> (u64, u64) {
+    /// lower right corner is at (2^zoom_level-1, 2^zoom_level-1)
+    let zoom_level = 8;  //2^8 = 512
+    use std::f64::consts::PI;
+    
+    (
+        f64::floor(1.0/(2.0*PI) * f64::powi(2.0, zoom_level) * (PI + lon)) as u64,
+        f64::floor(1.0/(2.0*PI) * f64::powi(2.0, zoom_level) * (PI - f64::ln(f64::tan(PI/4.0 + lat/2.0)))) as u64
+    )
+}
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing input file path command line argument"));
@@ -16,7 +77,7 @@ fn main() -> std::io::Result<()> {
     let mut buffered_file = std::io::BufReader::new(file); //new(file);
     let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
     let mut n_blobs_read = 0;
-    let max_n_blobs = 64;
+    let max_n_blobs = 768;
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
     let mut has_something = [[false; 180]; 360];  
     while let Ok((size, blob_header)) = read_blob_header(&mut buffered_file) {
@@ -116,17 +177,33 @@ fn main() -> std::io::Result<()> {
         n_blobs_read += 1;
     }
     println!("{}", n_blobs_read);
-    for lat_i in 0..180 {
-        for lon_i in 0..360 {
-            if has_something[lon_i][lat_i] {
-                print!("x");
-            } else {
-                print!(" ");
-            }
-        }
-        println!("");
-    }
+    plot(&has_something);
     Ok(())
+}
+
+fn plot(has_something: &[[bool; 180]; 360]) {
+    use plotters::prelude::*;
+
+    let root_area = BitMapBackend::new("plot.png", (512, 512))
+    .into_drawing_area();
+    root_area.fill(&WHITE).unwrap();
+    let mut ctx = ChartBuilder::on(&root_area).build_cartesian_2d(0..512, 0..512).unwrap();
+    ctx.configure_mesh().draw().unwrap();
+
+    ctx.draw_series(
+        has_something.iter().enumerate().filter_map(
+            |(lon, ps)| Some(ps.iter().enumerate().filter_map(
+                move |(lat, point)| {
+                    if *point {
+                        let (x, y) = web_mercator(f64::to_radians(lat as f64 - 90.0), f64::to_radians(lon as f64 - 180.0));
+                        Some(Circle::new((x as i32, y as i32), 1, &RED))
+                    } else {
+                        None
+                    }
+                }
+            ))
+        ).flatten()
+    ).unwrap(); 
 }
 
 /// Reads a blob header from the input stream and returns how many bytes total were read plus the blob header.

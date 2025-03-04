@@ -5,6 +5,7 @@ edition = "2021"
 [dependencies]
 prost = "0.13"
 flate2 = "1.1"
+plotters = "0.3.7"
 
 [build-dependencies]
 prost-build = "0.13.5"

@@ -53,8 +53,135 @@ Plan:
    threads for each output to be produced
 */
 
+/// See proto/fileformat.proto; we do not use the automatically generated Prost
+/// bindings for this, because Prost only allows us to decode the whole message
+/// at once, copying it in the process; we only want to read the minimum amount
+/// to determine what the compression type and raw_size of a blob is, then let
+/// the user read as much as they want (i.e. only one primitivegroup), instead
+/// of decoding the whole thing at once. This also has a pipelining-like effect:
+/// we don't have to block until the entire blob is decoded; instead, we can
+/// start processing the first primitivegroup as soon as just enough bytes to
+/// decompress it have been read
+#[repr(i32)]
+enum OSMBlobCompression {
+        Raw = 1,
+        Zlib = 3,
+        Lzma = 4,
+        ObsoleteBzip2 = 5,
+        Lz4 = 6,
+        Zstd = 7,
+}
+
+impl TryFrom<i32> for OSMBlobCompression {
+    type Error = ();
+    fn try_from(input: i32) -> Result<OSMBlobCompression, Self::Error> {
+        use OSMBlobCompression::*;
+        match input {
+            1 => Ok(Raw),
+            3 => Ok(Zlib),
+            4 => Ok(Lzma),
+            5 => Ok(ObsoleteBzip2),
+            6 => Ok(Lz4),
+            7 => Ok(Zstd),
+            _ => Err(())
+        }
+    }
+}
+
+struct OSMBlob {
+    header: osm::BlobHeader,
+    raw_size: usize,
+    compression: OSMBlobCompression
+}
+
+enum OSMStreamItem {
+    BlobStart(OSMBlob),
+    GroupStart,
+    Node,
+    NodeRef,
+    RelationStart,
+    RelationEnd,
+    WayStart,
+    WayEnd,
+    GroupEnd
+}
+
+const STREAM_BUF_SIZE: usize = 8192; 
+struct OSMStreamingReader<'a, InStream: std::io::Read> {
+    in_stream: &'a mut InStream,
+    current: Option<OSMStreamItem>,
+    _current_buf: [u8; STREAM_BUF_SIZE],
+    n_bytes_read: usize,
+    /// Read only up to `max_len` bytes
+    max_len: usize
+}
+
+impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
+
+    pub fn new(in_stream: &'a mut InStream) -> Self {
+        Self::new_with_max_len(in_stream, 0)
+    }
+
+    pub fn new_with_max_len(in_stream: &'a mut InStream, max_len: usize) -> Self {
+        let mut this = Self {
+            in_stream: in_stream,
+            current: None,
+            _current_buf: [0; STREAM_BUF_SIZE],
+            n_bytes_read: 0,
+            max_len: max_len
+        };
+        this.advance();
+        this
+    }
+
+    pub fn advance(&mut self) {
+
+    }
+    
+    /// Reads a blob header from the input stream and store the blob header.
+    /// Instead of decoding (and copying) the entire compressed contents, we then leave the buffer at that state to read
+    /// sequentially
+    fn _read_blob(&mut self) -> Result<(), OSMPBFParseError> {
+        const SIZE_SIZE: usize = 4;
+        let mut size_buffer: [u8; 4] = [0; 4];
+        std::io::Read::read_exact(self.in_stream, &mut size_buffer).map_err(|e| { OSMPBFParseError::new(e) } )?;
+        let size: usize = u32::from_be_bytes(size_buffer).try_into().map_err(|e| { OSMPBFParseError::new(e) })?;
+        std::io::Read::read_exact(self.in_stream, &mut self._current_buf[0..size]).map_err(|_| { OSMPBFParseError { root_cause: None } })?;
+        let blob_header = osm::BlobHeader::decode(&self._current_buf[0..size]).map_err(|e| { OSMPBFParseError::new(e) })?;
+
+        // raw_size field
+        let (field_tag, wire_type) = prost::encoding::decode_key(&mut &self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
+        assert!(field_tag == 1);
+        assert!(wire_type == prost::encoding::WireType::ThirtyTwoBit);
+        let raw_size = i32::decode(&self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
+
+        // oneof data
+        let (field_tag, wire_type) = prost::encoding::decode_key(&mut &self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
+        let compression_type = i32::decode(&self._current_buf[0..size]).map_err(OSMPBFParseError::new)?.try_into().map_err(|_|OSMPBFParseError{root_cause: None})?;
+
+        self.current = Some(OSMStreamItem::BlobStart(OSMBlob {
+            header: blob_header,
+            raw_size: raw_size.try_into().map_err(OSMPBFParseError::new)?,
+            compression: compression_type
+        }));
+        Ok(())
+    }
+
+    fn advance_group(&mut self) {
+
+    }
+    fn advance_relation(&mut self) {
+
+    }
+    fn advance_way(&mut self) {
+
+    }
+
+}
+
 use map_preparer::osm;
-use prost::Message;
+use plotters::style::SizeDesc;
+use prost::{bytes, Message};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -64,7 +191,7 @@ fn web_mercator(lat: f64, lon: f64) -> (u64, u64) {
     /// lower right corner is at (2^zoom_level-1, 2^zoom_level-1)
     let zoom_level = 8;  //2^8 = 512
     use std::f64::consts::PI;
-    
+
     (
         f64::floor(1.0/(2.0*PI) * f64::powi(2.0, zoom_level) * (PI + lon)) as u64,
         f64::floor(1.0/(2.0*PI) * f64::powi(2.0, zoom_level) * (PI - f64::ln(f64::tan(PI/4.0 + lat/2.0)))) as u64
@@ -75,17 +202,27 @@ fn main() -> std::io::Result<()> {
     let path = args.get(1).ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing input file path command line argument"));
     let mut file = std::fs::File::open(path?)?;
     let mut buffered_file = std::io::BufReader::new(file); //new(file);
+
     let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
     let mut n_blobs_read = 0;
-    let max_n_blobs = 768;
+    let mut n_bytes_read: usize = 0;
+    let skip_n_blobs = 0;
+    let max_n_blobs = 64;
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
-    let mut has_something = [[false; 180]; 360];  
+    let mut has_something = [[false; 181]; 361];  
     while let Ok((size, blob_header)) = read_blob_header(&mut buffered_file) {
+        n_bytes_read += size;
         if n_blobs_read >= max_n_blobs {
             break;
         }
         println!("Blob {:9}: Type: {}  Size: {}  Header size: {}", n_blobs_read, blob_header.r#type, blob_header.datasize, size);
-        if let Ok((size, blob)) = read_blob(&mut buffered_file, &blob_header) {
+        let read_raw_blob = read_blob(&mut buffered_file, &blob_header);
+        if n_blobs_read < skip_n_blobs {
+            n_blobs_read += 1;
+            continue;
+        }
+        if let Ok((size, blob)) = read_raw_blob {
+            n_bytes_read += size;
             println!("Uncompressed size: {}  Data type: {:?}", blob.raw_size(), match blob.data {
                 Some(osm::blob::Data::Raw(_)) => "raw",
                 Some(osm::blob::Data::ZlibData(_)) => "zlib",
@@ -176,12 +313,12 @@ fn main() -> std::io::Result<()> {
         //buffered_file.seek_relative(blob_header.datasize as i64);
         n_blobs_read += 1;
     }
-    println!("{}", n_blobs_read);
+    println!("{} blobs read ({} bytes)", n_blobs_read, n_bytes_read);
     plot(&has_something);
     Ok(())
 }
 
-fn plot(has_something: &[[bool; 180]; 360]) {
+fn plot(has_something: &[[bool; 181]; 361]) {
     use plotters::prelude::*;
 
     let root_area = BitMapBackend::new("plot.png", (512, 512))
@@ -206,48 +343,6 @@ fn plot(has_something: &[[bool; 180]; 360]) {
     ).unwrap(); 
 }
 
-/// Reads a blob header from the input stream and returns how many bytes total were read plus the blob header.
-fn read_blob_header(in_stream: &mut impl std::io::Read) -> Result<(usize, osm::BlobHeader), OSMPBFParseError> {
-    const SIZE_SIZE: usize = 4;
-    let mut size_buffer: [u8; 4] = [0; 4];
-    if SIZE_SIZE != std::io::Read::read(in_stream, &mut size_buffer).map_err(|e| { OSMPBFParseError::new(e) } )? {
-        return Err(OSMPBFParseError { root_cause: None })
-    }
-    let size: usize = u32::from_be_bytes(size_buffer).try_into().map_err(|e| { OSMPBFParseError::new(e) })?;
-    let mut blob_header_buffer = vec![0; size]; 
-    read_all(in_stream, size, &mut blob_header_buffer).map_err(|_| { OSMPBFParseError { root_cause: None } })?;
-    let blob_header = osm::BlobHeader::decode(&blob_header_buffer as &[u8]).map_err(|e| { OSMPBFParseError::new(e) })?;
-    Ok((size, blob_header))
-}
-
-/// A single read system call may only read partially; this function keeps reading
-fn read_all(in_stream: &mut impl std::io::Read, size: usize, buf: &mut [u8]) -> Result<(), ()> {
-    // TODO: does Read::read_exact do exactly what this function does? If so, replace
-    let mut unread_size: usize = size;
-    loop {
-        let read = 
-            std::io::Read::read(in_stream, &mut buf[(size-unread_size)..size])
-            .map_err(|_| { () } )?;
-        if 0 == read || read > unread_size {
-            return Err(())
-        };
-        unread_size -= read;
-        if unread_size == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
-
-/// Reads a blob
-fn read_blob(in_stream: &mut impl std::io::Read, header: &osm::BlobHeader) -> Result<(usize, osm::Blob), OSMPBFParseError> {
-    let compressed_size = header.datasize.try_into().map_err(OSMPBFParseError::new)?;
-    let mut buffer = vec![0; compressed_size];
-    read_all(in_stream, compressed_size, &mut buffer).map_err(|_| { OSMPBFParseError { root_cause: None } })?;
-    let blob = osm::Blob::decode(&buffer as &[u8]).map_err(OSMPBFParseError::new)?;
-    Ok((compressed_size, blob))
-}
 
 struct OSMPBFParseError {
     root_cause: Option<Box<dyn std::error::Error>>

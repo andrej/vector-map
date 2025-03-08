@@ -62,19 +62,18 @@ Plan:
 /// we don't have to block until the entire blob is decoded; instead, we can
 /// start processing the first primitivegroup as soon as just enough bytes to
 /// decompress it have been read
-#[repr(i32)]
 enum OSMBlobCompression {
-        Raw = 1,
-        Zlib = 3,
-        Lzma = 4,
-        ObsoleteBzip2 = 5,
-        Lz4 = 6,
-        Zstd = 7,
+        Raw,
+        Zlib,
+        Lzma,
+        ObsoleteBzip2,
+        Lz4,
+        Zstd,
 }
 
-impl TryFrom<i32> for OSMBlobCompression {
+impl TryFrom<u32> for OSMBlobCompression {
     type Error = ();
-    fn try_from(input: i32) -> Result<OSMBlobCompression, Self::Error> {
+    fn try_from(input: u32) -> Result<OSMBlobCompression, Self::Error> {
         use OSMBlobCompression::*;
         match input {
             1 => Ok(Raw),
@@ -95,25 +94,22 @@ struct OSMBlob {
 }
 
 enum OSMStreamItem {
-    BlobStart(OSMBlob),
-    GroupStart,
+    Blob(OSMBlob),
+    Group,
     Node,
     NodeRef,
-    RelationStart,
-    RelationEnd,
-    WayStart,
-    WayEnd,
-    GroupEnd
+    Relation,
+    Way,
 }
 
 const STREAM_BUF_SIZE: usize = 8192; 
 struct OSMStreamingReader<'a, InStream: std::io::Read> {
     in_stream: &'a mut InStream,
-    current: Option<OSMStreamItem>,
-    _current_buf: [u8; STREAM_BUF_SIZE],
+    current: Vec<OSMStreamItem>,
     n_bytes_read: usize,
     /// Read only up to `max_len` bytes
-    max_len: usize
+    max_len: usize,
+    bytes: bytes::BytesMut,
 }
 
 impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
@@ -125,45 +121,92 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
     pub fn new_with_max_len(in_stream: &'a mut InStream, max_len: usize) -> Self {
         let mut this = Self {
             in_stream: in_stream,
-            current: None,
-            _current_buf: [0; STREAM_BUF_SIZE],
+            current: Vec::with_capacity(4),
             n_bytes_read: 0,
-            max_len: max_len
+            max_len: max_len,
+            bytes: bytes::BytesMut::with_capacity(STREAM_BUF_SIZE)
         };
         this.advance();
         this
     }
 
     pub fn advance(&mut self) {
+        let stack_top = self.current.last();
+        match stack_top {
+            // 
+            None => self._read_blob_head(),
+            // 
+            Some(OSMStreamItem::Blob(blob)) => {
+                Ok(())
+            }
+            //
+            Some(_) => {
+                Ok(())
+            }
+        };
+    }
 
+    /// Read exactly `n` bytes into self.bytes, unless EOF occurs first, in
+    /// which case we read upto EOF and return the number of bytes read (<n)
+    fn _read_bytes_upto(&mut self, n: usize) -> Result<usize, OSMPBFParseError> {
+        let mut buf: Vec<u8> = vec![0; n];
+        let mut i = 0;
+        while let Ok(m) = std::io::Read::read(self.in_stream, &mut buf[i..(n-i)]) {
+            if m == 0 {
+                break;
+            }
+            i += m;
+        }
+        bytes::BufMut::put(&mut self.bytes, &buf[0..i]);
+        Ok(i)
+    }
+
+    /// Call this when you are done processing the bytes in self._bytes to re-
+    /// use the memory. The buffer will be cleared for reuse, and any un-
+    /// consumed bytes that have already been read (self.bytes.remaining()) will
+    /// be copied to the start of the buffer.
+    fn _reset_bytes(&mut self) {
+        // let unconsumed = prost::bytes::Buf::copy_to_bytes(&mut self.bytes, prost::bytes::Buf::remaining(&self.bytes));
+        // self.bytes.clear();
+        // bytes::BufMut::put(&mut self.bytes, unconsumed);
+        self.bytes.split_off(self.bytes.len() - prost::bytes::Buf::remaining(&self.bytes));
     }
     
     /// Reads a blob header from the input stream and store the blob header.
     /// Instead of decoding (and copying) the entire compressed contents, we then leave the buffer at that state to read
     /// sequentially
-    fn _read_blob(&mut self) -> Result<(), OSMPBFParseError> {
+    fn _read_blob_head(&mut self) -> Result<(), OSMPBFParseError> {
+        // Blob header
         const SIZE_SIZE: usize = 4;
-        let mut size_buffer: [u8; 4] = [0; 4];
-        std::io::Read::read_exact(self.in_stream, &mut size_buffer).map_err(|e| { OSMPBFParseError::new(e) } )?;
-        let size: usize = u32::from_be_bytes(size_buffer).try_into().map_err(|e| { OSMPBFParseError::new(e) })?;
-        std::io::Read::read_exact(self.in_stream, &mut self._current_buf[0..size]).map_err(|_| { OSMPBFParseError { root_cause: None } })?;
-        let blob_header = osm::BlobHeader::decode(&self._current_buf[0..size]).map_err(|e| { OSMPBFParseError::new(e) })?;
+        self._read_bytes_upto(SIZE_SIZE)?;
+        let size: usize = bytes::Buf::get_u32(&mut self.bytes).try_into().map_err(OSMPBFParseError::new)?;
+        self._read_bytes_upto(size)?;
+        let blob_header = osm::BlobHeader::decode(&mut self.bytes).map_err(|e| { OSMPBFParseError::new(e) })?;
+
+        // Blob itself
+        // We decode only the first field (raw_size), followed by the metadata
+        // of the second field, which will tell us which compression is used.
+        // Since the field metadata can be up to 10 bytes (varint encoding) and
+        // the first field is a 4-byte integer, we read upto 24 bytes.
+        const SIZE_FIRST_TWO: usize = 24;
+        self._read_bytes_upto(SIZE_FIRST_TWO);
 
         // raw_size field
-        let (field_tag, wire_type) = prost::encoding::decode_key(&mut &self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
+        let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
         assert!(field_tag == 1);
         assert!(wire_type == prost::encoding::WireType::ThirtyTwoBit);
-        let raw_size = i32::decode(&self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
+        let raw_size = i32::decode(&mut self.bytes).map_err(OSMPBFParseError::new)?;
 
         // oneof data
-        let (field_tag, wire_type) = prost::encoding::decode_key(&mut &self._current_buf[0..size]).map_err(OSMPBFParseError::new)?;
-        let compression_type = i32::decode(&self._current_buf[0..size]).map_err(OSMPBFParseError::new)?.try_into().map_err(|_|OSMPBFParseError{root_cause: None})?;
+        let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
+        let compression_type = field_tag.try_into().map_err(|_| OSMPBFParseError{root_cause: None})?;
 
-        self.current = Some(OSMStreamItem::BlobStart(OSMBlob {
+        self.current.push(OSMStreamItem::Blob(OSMBlob {
             header: blob_header,
             raw_size: raw_size.try_into().map_err(OSMPBFParseError::new)?,
             compression: compression_type
         }));
+        
         Ok(())
     }
 

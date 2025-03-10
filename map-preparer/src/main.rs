@@ -103,16 +103,23 @@ enum OSMStreamItem {
 }
 
 const STREAM_BUF_SIZE: usize = 8192; 
-struct OSMStreamingReader<'a, InStream: std::io::Read> {
+struct OSMStreamingReader<'a, InStream: std::io::Read + std::io::Seek> {
     in_stream: &'a mut InStream,
-    current: Vec<OSMStreamItem>,
+    // current is a stack of what we are currently parsing in the file along
+    // with the anticipated size in the input stream of what we are currently
+    // parsing; for example, if we are currently parsing a Relation, the stack
+    // will consist of Blob->PrimitiveGroup->Group->Relation->NodeRef items,
+    // each of which is a tuple (item, start_offset), where start_offset is the
+    // byte offset from the input stream at which we started parsing this
+    // object
+    current: Vec<(usize, usize, OSMStreamItem)>,
     n_bytes_read: usize,
     /// Read only up to `max_len` bytes
     max_len: usize,
     bytes: bytes::BytesMut,
 }
 
-impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
+impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStream> {
 
     pub fn new(in_stream: &'a mut InStream) -> Self {
         Self::new_with_max_len(in_stream, 0)
@@ -134,9 +141,9 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
         let stack_top = self.current.last();
         match stack_top {
             // 
-            None => self._read_blob_head(),
+            None => self.read_blob_head(),
             // 
-            Some(OSMStreamItem::Blob(blob)) => {
+            Some((_, _, OSMStreamItem::Blob(blob))) => {
                 Ok(())
             }
             //
@@ -151,12 +158,18 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
     fn _read_bytes_upto(&mut self, n: usize) -> Result<usize, OSMPBFParseError> {
         let mut buf: Vec<u8> = vec![0; n];
         let mut i = 0;
-        while let Ok(m) = std::io::Read::read(self.in_stream, &mut buf[i..(n-i)]) {
-            if m == 0 {
+        let n_to_read = if self.max_len > 0 {
+            usize::min(n, self.max_len - self.n_bytes_read)
+        }  else {
+            n
+        };
+        while let Ok(n_read_this_iter) = std::io::Read::read(self.in_stream, &mut buf[i..(n_to_read-i)]) {
+            if n_read_this_iter == 0 {
                 break;
             }
-            i += m;
+            i += n_read_this_iter;
         }
+        self.n_bytes_read += i;
         bytes::BufMut::put(&mut self.bytes, &buf[0..i]);
         Ok(i)
     }
@@ -169,18 +182,21 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
         // let unconsumed = prost::bytes::Buf::copy_to_bytes(&mut self.bytes, prost::bytes::Buf::remaining(&self.bytes));
         // self.bytes.clear();
         // bytes::BufMut::put(&mut self.bytes, unconsumed);
-        self.bytes.split_off(self.bytes.len() - prost::bytes::Buf::remaining(&self.bytes));
+        self.bytes = self.bytes.split_off(self.bytes.len() - prost::bytes::Buf::remaining(&self.bytes));
     }
     
     /// Reads a blob header from the input stream and store the blob header.
     /// Instead of decoding (and copying) the entire compressed contents, we then leave the buffer at that state to read
     /// sequentially
-    fn _read_blob_head(&mut self) -> Result<(), OSMPBFParseError> {
+    fn read_blob_head(&mut self) -> Result<(), OSMPBFParseError> {
+        let start_offset = self.n_bytes_read;
+        let mut n_read: usize = 0;
+
         // Blob header
         const SIZE_SIZE: usize = 4;
-        self._read_bytes_upto(SIZE_SIZE)?;
+        n_read += self._read_bytes_upto(SIZE_SIZE)?;
         let size: usize = bytes::Buf::get_u32(&mut self.bytes).try_into().map_err(OSMPBFParseError::new)?;
-        self._read_bytes_upto(size)?;
+        n_read += self._read_bytes_upto(size)?;
         let blob_header = osm::BlobHeader::decode(&mut self.bytes).map_err(|e| { OSMPBFParseError::new(e) })?;
 
         // Blob itself
@@ -189,7 +205,7 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
         // Since the field metadata can be up to 10 bytes (varint encoding) and
         // the first field is a 4-byte integer, we read upto 24 bytes.
         const SIZE_FIRST_TWO: usize = 24;
-        self._read_bytes_upto(SIZE_FIRST_TWO);
+        n_read += self._read_bytes_upto(SIZE_FIRST_TWO)?;
 
         // raw_size field
         let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
@@ -201,22 +217,43 @@ impl<'a, InStream: std::io::Read> OSMStreamingReader<'a, InStream> {
         let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
         let compression_type = field_tag.try_into().map_err(|_| OSMPBFParseError{root_cause: None})?;
 
-        self.current.push(OSMStreamItem::Blob(OSMBlob {
-            header: blob_header,
-            raw_size: raw_size.try_into().map_err(OSMPBFParseError::new)?,
-            compression: compression_type
-        }));
-        
+        // total size of this blob, including header and size prefix
+        let total_size = SIZE_SIZE + blob_header.datasize as usize;
+
+        // Push onto the stack
+        self.current.push(
+            (  
+                start_offset,
+                total_size,
+                OSMStreamItem::Blob(OSMBlob {
+                    header: blob_header,
+                    raw_size: raw_size.try_into().map_err(OSMPBFParseError::new)?,
+                    compression: compression_type
+                })
+            )
+        );
+
         Ok(())
     }
 
-    fn advance_group(&mut self) {
+    /// Skip parsing the remainder of the current object on top of the stack
+    fn skip(&mut self) -> bool {
+        if let Some((top_start, top_size, _)) = self.current.last() {
+            let remaining: i64 = (top_start + top_size) as i64 - self.n_bytes_read as i64;
+            assert!(remaining >= 0);
+            std::io::Seek::seek(&mut self.in_stream, std::io::SeekFrom::Current(remaining));
+            return true
+        }   
+        false
+    }
+
+    fn read_group(&mut self) {
 
     }
-    fn advance_relation(&mut self) {
+    fn read_relation(&mut self) {
 
     }
-    fn advance_way(&mut self) {
+    fn read_way(&mut self) {
 
     }
 
@@ -385,7 +422,6 @@ fn plot(has_something: &[[bool; 181]; 361]) {
         ).flatten()
     ).unwrap(); 
 }
-
 
 struct OSMPBFParseError {
     root_cause: Option<Box<dyn std::error::Error>>

@@ -11,6 +11,13 @@ Plan:
 
  - streaming decoder
    - reads minimum number of bytes needed from input stream on demand
+     !! This won't be possible entirely due to the way the data format is
+        structured. For example, a PrimitiveBlock has all PrimitiveGroups first
+        in memory; only then do the granularity and lat_lon offset fields 
+        follow. This is an issue since these latter fields are needed to 
+        correctly compute lat/lons for the elements inside the PrimitiveGroups.
+        Since everything is compressed, we also cannot cheaply seek further down
+        in the file (wouldn't know the compressed offset)...
    - decompresses minimum number of bytes to read next item (i.e. read header
      first to determine how much to read, then only read length indicated in 
      header, etc.)
@@ -62,6 +69,7 @@ Plan:
 /// we don't have to block until the entire blob is decoded; instead, we can
 /// start processing the first primitivegroup as soon as just enough bytes to
 /// decompress it have been read
+#[derive(Clone, Copy)]
 enum OSMBlobCompression {
         Raw,
         Zlib,
@@ -69,6 +77,16 @@ enum OSMBlobCompression {
         ObsoleteBzip2,
         Lz4,
         Zstd,
+}
+
+impl OSMBlobCompression {
+    fn get_decompressor<'a>(&self, compressed_stream: &'a mut impl std::io::BufRead) -> Option<Box<dyn std::io::Read + 'a>> {
+        match self {
+            OSMBlobCompression::Raw => Some(Box::new(compressed_stream)),
+            OSMBlobCompression::Zlib => Some(Box::new(flate2::bufread::ZlibDecoder::new(compressed_stream))),
+            _ => None
+        }
+    }
 }
 
 impl TryFrom<u32> for OSMBlobCompression {
@@ -103,8 +121,11 @@ enum OSMStreamItem {
 }
 
 const STREAM_BUF_SIZE: usize = 8192; 
-struct OSMStreamingReader<'a, InStream: std::io::Read + std::io::Seek> {
+struct OSMStreamingReader<'a, InStream> 
+where InStream: std::io::BufRead + std::io::Seek
+{
     in_stream: &'a mut InStream,
+    decompressed_stream: Option<Box<dyn std::io::Read>>,
     // current is a stack of what we are currently parsing in the file along
     // with the anticipated size in the input stream of what we are currently
     // parsing; for example, if we are currently parsing a Relation, the stack
@@ -119,7 +140,9 @@ struct OSMStreamingReader<'a, InStream: std::io::Read + std::io::Seek> {
     bytes: bytes::BytesMut,
 }
 
-impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStream> {
+impl<'a, InStream> OSMStreamingReader<'a, InStream> 
+where InStream: std::io::BufRead + std::io::Seek
+{
 
     pub fn new(in_stream: &'a mut InStream) -> Self {
         Self::new_with_max_len(in_stream, 0)
@@ -128,6 +151,7 @@ impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStrea
     pub fn new_with_max_len(in_stream: &'a mut InStream, max_len: usize) -> Self {
         let mut this = Self {
             in_stream: in_stream,
+            decompressed_stream: None,
             current: Vec::with_capacity(4),
             n_bytes_read: 0,
             max_len: max_len,
@@ -144,7 +168,11 @@ impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStrea
             None => self.read_blob_head(),
             // 
             Some((_, _, OSMStreamItem::Blob(blob))) => {
-                Ok(())
+                match blob.header.r#type.as_str() {
+                    "OSMHeader" => Ok(()),
+                    "OSMData" => self.read_primitive_block(),
+                    _ => Ok(()),
+                }
             }
             //
             Some(_) => {
@@ -215,7 +243,7 @@ impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStrea
 
         // oneof data
         let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
-        let compression_type = field_tag.try_into().map_err(|_| OSMPBFParseError{root_cause: None})?;
+        let compression_type: OSMBlobCompression = field_tag.try_into().map_err(|_| OSMPBFParseError{root_cause: None})?;
 
         // total size of this blob, including header and size prefix
         let total_size = SIZE_SIZE + blob_header.datasize as usize;
@@ -232,6 +260,13 @@ impl<'a, InStream: std::io::Read + std::io::Seek> OSMStreamingReader<'a, InStrea
                 })
             )
         );
+
+        self.decompressed_stream = compression_type.get_decompressor(&mut self.in_stream);
+
+        Ok(())
+    }
+
+    fn read_primitive_block(&mut self) -> Result<(), OSMPBFParseError> {
 
         Ok(())
     }

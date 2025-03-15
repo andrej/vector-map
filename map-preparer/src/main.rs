@@ -60,6 +60,24 @@ Plan:
    threads for each output to be produced
 */
 
+trait OSMStream : std::io::BufRead {} //+ std::io::Seek {}
+
+enum InStream<RawT> {
+    None,
+    Raw(RawT),
+    Zlib(flate2::bufread::ZlibDecoder<RawT>)
+}
+
+impl<RawT> InStream<RawT> {
+    fn into_inner(self) -> Self {
+        match self {
+            InStream::None => InStream::None,
+            InStream::Raw(x) => InStream::Raw(x),
+            InStream::Zlib(x) => InStream::Raw(x.into_inner())
+        }
+    }
+}
+
 /// See proto/fileformat.proto; we do not use the automatically generated Prost
 /// bindings for this, because Prost only allows us to decode the whole message
 /// at once, copying it in the process; we only want to read the minimum amount
@@ -78,13 +96,13 @@ enum OSMBlobCompression {
         Lz4,
         Zstd,
 }
-
 impl OSMBlobCompression {
-    fn get_decompressor<'a>(&self, compressed_stream: &'a mut impl std::io::BufRead) -> Option<Box<dyn std::io::Read + 'a>> {
+    fn get_decompressor<'a, RawT>(&self, compressed_stream: RawT) -> InStream<RawT>
+    where RawT: std::io::BufRead {
         match self {
-            OSMBlobCompression::Raw => Some(Box::new(compressed_stream)),
-            OSMBlobCompression::Zlib => Some(Box::new(flate2::bufread::ZlibDecoder::new(compressed_stream))),
-            _ => None
+            OSMBlobCompression::Raw => InStream::Raw(compressed_stream),
+            OSMBlobCompression::Zlib => InStream::Zlib(flate2::bufread::ZlibDecoder::new(compressed_stream)),
+            _ => panic!("unsupported compression type")
         }
     }
 }
@@ -113,19 +131,39 @@ struct OSMBlob {
 
 enum OSMStreamItem {
     Blob(OSMBlob),
-    Group,
-    Node,
-    NodeRef,
-    Relation,
-    Way,
+    Block(osm::PrimitiveBlock)
+}
+
+
+impl<RawT> InStream<RawT> 
+where RawT: std::io::BufRead,
+{
+    fn dyn_readable_inner(&mut self) -> Box<&mut dyn std::io::Read> {
+        match self {
+            InStream::None => panic!("invalid state for InStream"),
+            InStream::Raw(x) => Box::new(x),
+            InStream::Zlib(x) => Box::new(x)
+        }
+    }
+}
+
+impl<RawT> InStream<RawT>
+where RawT: std::io::BufRead + std::io::Seek
+{
+    fn dyn_seekable_inner(&mut self) -> Option<Box<&mut dyn std::io::Seek>> {
+        match self{
+            InStream::None => panic!("invalid state for InStream"),
+            InStream::Raw(x) => Some(Box::new(x)),
+            InStream::Zlib(x) => None // zlib streams are not seekable
+        }
+    }
 }
 
 const STREAM_BUF_SIZE: usize = 8192; 
-struct OSMStreamingReader<'a, InStream> 
-where InStream: std::io::BufRead + std::io::Seek
+struct OSMStreamingReader<RawT> 
+where
 {
-    in_stream: &'a mut InStream,
-    decompressed_stream: Option<Box<dyn std::io::Read>>,
+    in_stream: InStream<RawT>,
     // current is a stack of what we are currently parsing in the file along
     // with the anticipated size in the input stream of what we are currently
     // parsing; for example, if we are currently parsing a Relation, the stack
@@ -140,22 +178,21 @@ where InStream: std::io::BufRead + std::io::Seek
     bytes: bytes::BytesMut,
 }
 
-impl<'a, InStream> OSMStreamingReader<'a, InStream> 
-where InStream: std::io::BufRead + std::io::Seek
+impl<RawT> OSMStreamingReader<RawT> 
+where RawT: std::io::BufRead + std::io::Seek
 {
 
-    pub fn new(in_stream: &'a mut InStream) -> Self {
+    pub fn new(in_stream: RawT) -> Self {
         Self::new_with_max_len(in_stream, 0)
     }
 
-    pub fn new_with_max_len(in_stream: &'a mut InStream, max_len: usize) -> Self {
+    pub fn new_with_max_len(in_stream: RawT, max_len: usize) -> Self {
         let mut this = Self {
-            in_stream: in_stream,
-            decompressed_stream: None,
+            in_stream: InStream::Raw(in_stream),
             current: Vec::with_capacity(4),
             n_bytes_read: 0,
             max_len: max_len,
-            bytes: bytes::BytesMut::with_capacity(STREAM_BUF_SIZE)
+            bytes: bytes::BytesMut::with_capacity(STREAM_BUF_SIZE),
         };
         this.advance();
         this
@@ -164,9 +201,9 @@ where InStream: std::io::BufRead + std::io::Seek
     pub fn advance(&mut self) {
         let stack_top = self.current.last();
         match stack_top {
-            // 
+            // start of stream/blob
             None => self.read_blob_head(),
-            // 
+            // at the beginning of a blob, read the header
             Some((_, _, OSMStreamItem::Blob(blob))) => {
                 match blob.header.r#type.as_str() {
                     "OSMHeader" => Ok(()),
@@ -174,8 +211,9 @@ where InStream: std::io::BufRead + std::io::Seek
                     _ => Ok(()),
                 }
             }
-            //
-            Some(_) => {
+            // 
+            Some((_, _, OSMStreamItem::Block(block))) => {
+                self.current.pop();
                 Ok(())
             }
         };
@@ -191,7 +229,7 @@ where InStream: std::io::BufRead + std::io::Seek
         }  else {
             n
         };
-        while let Ok(n_read_this_iter) = std::io::Read::read(self.in_stream, &mut buf[i..(n_to_read-i)]) {
+        while let Ok(n_read_this_iter) = std::io::Read::read(*self.in_stream.dyn_readable_inner(), &mut buf[i..(n_to_read-i)]) {
             if n_read_this_iter == 0 {
                 break;
             }
@@ -211,6 +249,24 @@ where InStream: std::io::BufRead + std::io::Seek
         // self.bytes.clear();
         // bytes::BufMut::put(&mut self.bytes, unconsumed);
         self.bytes = self.bytes.split_off(self.bytes.len() - prost::bytes::Buf::remaining(&self.bytes));
+    }
+
+    /// Swap the current in_stream with a decompressed one, based on the
+    /// indicated compression type
+    fn _activate_decompression(&mut self, compression_type: OSMBlobCompression) {
+        let old_in_stream = std::mem::replace(&mut self.in_stream, InStream::None);
+        if let InStream::Raw(raw_s) = old_in_stream {
+            self.in_stream = compression_type.get_decompressor(raw_s);
+        } else {
+            panic!("Invalid stream state");
+        }
+    }
+
+    /// Turn of decompression; call this after you are done reading from the 
+    /// compressed block
+    fn _deactivate_decompression(&mut self) {
+        let old_in_stream = std::mem::replace(&mut self.in_stream, InStream::None);
+        self.in_stream = old_in_stream.into_inner();
     }
     
     /// Reads a blob header from the input stream and store the blob header.
@@ -261,13 +317,37 @@ where InStream: std::io::BufRead + std::io::Seek
             )
         );
 
-        self.decompressed_stream = compression_type.get_decompressor(&mut self.in_stream);
+        // Initialize decompression
+        self._activate_decompression(compression_type);
 
         Ok(())
     }
 
     fn read_primitive_block(&mut self) -> Result<(), OSMPBFParseError> {
-
+        let mut to_read: usize = 0;
+        let mut granularity = 0;
+        if let Some((_, _, OSMStreamItem::Blob(blob))) = self.current.last() {
+            to_read = blob.header.datasize.try_into().expect("blob datasize should be positive and fit into a usize");
+        } else {
+            panic!("read_primitive_block expects a blob on the parsing stack")
+        }
+        let n_read = self._read_bytes_upto(to_read).expect("something went wrong reading");
+        if n_read != to_read {
+            panic!("fewer bytes read ({}) than announced in blob header ({})", n_read, to_read);
+        }
+        let decoded_data = osm::PrimitiveBlock::decode(&mut self.bytes).expect("couldn't read data block");
+        let string_table: Vec<String> = decoded_data.stringtable.s.iter().map(|str| std::str::from_utf8(&str).expect("invalid string").to_string()).collect();
+        let lat_offset = decoded_data.lat_offset();
+        let lon_offset = decoded_data.lon_offset();
+        let granularity = decoded_data.granularity();
+        let coord_decode = |coord: i64, offset: i64| -> f64 {
+            1e-9 * ((offset + (granularity as i64) * coord) as f64)
+        };
+        // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
+        for group in decoded_data.primitivegroup.iter() {
+            for node in &group.nodes {
+            }
+        }
         Ok(())
     }
 
@@ -276,23 +356,17 @@ where InStream: std::io::BufRead + std::io::Seek
         if let Some((top_start, top_size, _)) = self.current.last() {
             let remaining: i64 = (top_start + top_size) as i64 - self.n_bytes_read as i64;
             assert!(remaining >= 0);
-            std::io::Seek::seek(&mut self.in_stream, std::io::SeekFrom::Current(remaining));
+            if let Some(mut seekable) = self.in_stream.dyn_seekable_inner() {
+                std::io::Seek::seek(&mut *seekable, std::io::SeekFrom::Current(remaining));
+            }
             return true
         }   
         false
     }
 
-    fn read_group(&mut self) {
-
-    }
-    fn read_relation(&mut self) {
-
-    }
-    fn read_way(&mut self) {
-
-    }
-
 }
+
+use std::{cell::{RefCell, RefMut}, marker::PhantomData, rc::Rc};
 
 use map_preparer::osm;
 use plotters::style::SizeDesc;
@@ -350,7 +424,13 @@ fn main() -> std::io::Result<()> {
             });
             let raw_size = blob.raw_size() as usize;
             if let Some(osm::blob::Data::ZlibData(data)) = blob.data {
-                let mut decompressor = flate2::bufread::ZlibDecoder::new(&data[..]);
+
+                let bf = &mut buffered_file;
+                let mut decompressor = flate2::bufread::ZlibDecoder::new(bf);
+                let buf = [0 as u8;32];
+                std::io::Read::read(bf, &mut buf);
+                std::io::Read::read(&mut decompressor, &mut buf);
+
                 let mut decompressed = vec![0; raw_size]; 
                 std::io::Read::read_exact(&mut decompressor, &mut decompressed).expect("couldn't decompress bytes");
                 let osm_type: String = blob_header.r#type;
@@ -458,6 +538,7 @@ fn plot(has_something: &[[bool; 181]; 361]) {
     ).unwrap(); 
 }
 
+#[derive(Debug)]
 struct OSMPBFParseError {
     root_cause: Option<Box<dyn std::error::Error>>
 }

@@ -129,9 +129,15 @@ struct OSMBlob {
     compression: OSMBlobCompression
 }
 
+struct OSMBlock {
+    block: osm::PrimitiveBlock,
+    string_table: Vec<String>
+}
+
 enum OSMStreamItem {
     Blob(OSMBlob),
-    Block(osm::PrimitiveBlock)
+    Header(osm::HeaderBlock),
+    Block(OSMBlock),
 }
 
 
@@ -154,7 +160,7 @@ where RawT: std::io::BufRead + std::io::Seek
         match self{
             InStream::None => panic!("invalid state for InStream"),
             InStream::Raw(x) => Some(Box::new(x)),
-            InStream::Zlib(x) => None // zlib streams are not seekable
+            InStream::Zlib(_) => None // zlib streams are not seekable
         }
     }
 }
@@ -187,36 +193,48 @@ where RawT: std::io::BufRead + std::io::Seek
     }
 
     pub fn new_with_max_len(in_stream: RawT, max_len: usize) -> Self {
-        let mut this = Self {
+        Self {
             in_stream: InStream::Raw(in_stream),
             current: Vec::with_capacity(4),
             n_bytes_read: 0,
             max_len: max_len,
             bytes: bytes::BytesMut::with_capacity(STREAM_BUF_SIZE),
-        };
-        this.advance();
-        this
+        }
     }
 
-    pub fn advance(&mut self) {
+    pub fn advance(&mut self) -> bool {
         let stack_top = self.current.last();
         match stack_top {
+            // element at the top of the stack is completely parsed, pop it
+            Some((start_offset, total_size, _)) if start_offset + total_size >= self.n_bytes_read => {
+                self.current.pop();
+                true
+            }
             // start of stream/blob
-            None => self.read_blob_head(),
-            // at the beginning of a blob, read the header
+            None => {
+                self._deactivate_decompression();
+                if self.read_blob_head().expect("parse error in blob head") {
+                    if let Some((_, _, OSMStreamItem::Blob(OSMBlob { header: _, raw_size: _, compression: compression }))) = &self.current.last() {
+                        self._activate_decompression(*compression);
+                        true
+                    } else {
+                        panic!("after successful blob head parse, top of stack is not a blob?")
+                    }
+                } else {
+                    false
+                }
+            },
+            // 
             Some((_, _, OSMStreamItem::Blob(blob))) => {
                 match blob.header.r#type.as_str() {
-                    "OSMHeader" => Ok(()),
-                    "OSMData" => self.read_primitive_block(),
-                    _ => Ok(()),
+                    "OSMHeader" => { self.read_header_block().expect("parse error in header block") },
+                    "OSMData" => { self.read_primitive_block().expect("parse error in primitive block") },
+                    _ => false,
                 }
             }
-            // 
-            Some((_, _, OSMStreamItem::Block(block))) => {
-                self.current.pop();
-                Ok(())
-            }
-        };
+            // Unexpected state
+            _ => panic!("unexpected parser state") 
+        }
     }
 
     /// Read exactly `n` bytes into self.bytes, unless EOF occurs first, in
@@ -229,7 +247,7 @@ where RawT: std::io::BufRead + std::io::Seek
         }  else {
             n
         };
-        while let Ok(n_read_this_iter) = std::io::Read::read(*self.in_stream.dyn_readable_inner(), &mut buf[i..(n_to_read-i)]) {
+        while let Ok(n_read_this_iter) = std::io::Read::read(*self.in_stream.dyn_readable_inner(), &mut buf[i..n_to_read]) {
             if n_read_this_iter == 0 {
                 break;
             }
@@ -272,15 +290,19 @@ where RawT: std::io::BufRead + std::io::Seek
     /// Reads a blob header from the input stream and store the blob header.
     /// Instead of decoding (and copying) the entire compressed contents, we then leave the buffer at that state to read
     /// sequentially
-    fn read_blob_head(&mut self) -> Result<(), OSMPBFParseError> {
+    fn read_blob_head(&mut self) -> Result<bool, OSMPBFParseError> {
         let start_offset = self.n_bytes_read;
         let mut n_read: usize = 0;
 
         // Blob header
         const SIZE_SIZE: usize = 4;
         n_read += self._read_bytes_upto(SIZE_SIZE)?;
-        let size: usize = bytes::Buf::get_u32(&mut self.bytes).try_into().map_err(OSMPBFParseError::new)?;
-        n_read += self._read_bytes_upto(size)?;
+        if n_read != SIZE_SIZE {
+            // reached end of stream
+            return Ok(false);
+        }
+        let header_size: usize = bytes::Buf::get_u32(&mut self.bytes).try_into().map_err(OSMPBFParseError::new)?;
+        n_read += self._read_bytes_upto(header_size)?;
         let blob_header = osm::BlobHeader::decode(&mut self.bytes).map_err(|e| { OSMPBFParseError::new(e) })?;
 
         // Blob itself
@@ -302,7 +324,7 @@ where RawT: std::io::BufRead + std::io::Seek
         let compression_type: OSMBlobCompression = field_tag.try_into().map_err(|_| OSMPBFParseError{root_cause: None})?;
 
         // total size of this blob, including header and size prefix
-        let total_size = SIZE_SIZE + blob_header.datasize as usize;
+        let total_size = SIZE_SIZE + header_size + blob_header.datasize as usize;
 
         // Push onto the stack
         self.current.push(
@@ -316,16 +338,33 @@ where RawT: std::io::BufRead + std::io::Seek
                 })
             )
         );
-
-        // Initialize decompression
-        self._activate_decompression(compression_type);
-
-        Ok(())
+        Ok(true)
     }
 
-    fn read_primitive_block(&mut self) -> Result<(), OSMPBFParseError> {
+    fn read_header_block(&mut self) -> Result<bool, OSMPBFParseError> {
+        let start_offset = self.n_bytes_read;
         let mut to_read: usize = 0;
-        let mut granularity = 0;
+        if let Some((_, _, OSMStreamItem::Blob(blob))) = self.current.last() {
+            to_read = blob.header.datasize.try_into().expect("blob datasize should be positive and fit into a usize");
+        } else {
+            panic!("read_primitive_block expects a blob on the parsing stack")
+        }
+        let n_read = self._read_bytes_upto(to_read).expect("something went wrong reading");
+        if n_read != to_read {
+            panic!("fewer bytes read ({}) than announced in blob header ({})", n_read, to_read);
+        }
+        let header = osm::HeaderBlock::decode(&mut self.bytes).expect("couldn't read header block");
+        self.current.push((
+            start_offset,
+            to_read,
+            OSMStreamItem::Header(header)
+        ));
+        Ok(true)
+    }
+
+    fn read_primitive_block(&mut self) -> Result<bool, OSMPBFParseError> {
+        let start_offset = self.n_bytes_read;
+        let mut to_read: usize = 0;
         if let Some((_, _, OSMStreamItem::Blob(blob))) = self.current.last() {
             to_read = blob.header.datasize.try_into().expect("blob datasize should be positive and fit into a usize");
         } else {
@@ -337,31 +376,31 @@ where RawT: std::io::BufRead + std::io::Seek
         }
         let decoded_data = osm::PrimitiveBlock::decode(&mut self.bytes).expect("couldn't read data block");
         let string_table: Vec<String> = decoded_data.stringtable.s.iter().map(|str| std::str::from_utf8(&str).expect("invalid string").to_string()).collect();
-        let lat_offset = decoded_data.lat_offset();
-        let lon_offset = decoded_data.lon_offset();
-        let granularity = decoded_data.granularity();
-        let coord_decode = |coord: i64, offset: i64| -> f64 {
-            1e-9 * ((offset + (granularity as i64) * coord) as f64)
-        };
-        // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
-        for group in decoded_data.primitivegroup.iter() {
-            for node in &group.nodes {
-            }
-        }
-        Ok(())
+        self.current.push(
+            (
+                start_offset,
+                to_read,
+                OSMStreamItem::Block(OSMBlock {
+                    block: decoded_data,
+                    string_table: string_table 
+                })
+            )
+        );
+        Ok(true)
     }
 
     /// Skip parsing the remainder of the current object on top of the stack
-    fn skip(&mut self) -> bool {
+    fn skip(&mut self) {
         if let Some((top_start, top_size, _)) = self.current.last() {
             let remaining: i64 = (top_start + top_size) as i64 - self.n_bytes_read as i64;
             assert!(remaining >= 0);
             if let Some(mut seekable) = self.in_stream.dyn_seekable_inner() {
                 std::io::Seek::seek(&mut *seekable, std::io::SeekFrom::Current(remaining));
+                self.n_bytes_read += remaining as usize;
+                return
             }
-            return true
         }   
-        false
+        panic!("could not seek")
     }
 
 }
@@ -397,113 +436,102 @@ fn main() -> std::io::Result<()> {
     let mut n_bytes_read: usize = 0;
     let skip_n_blobs = 0;
     let max_n_blobs = 64;
+
+    let mut parser = OSMStreamingReader::new(buffered_file);
+
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
     let mut has_something = [[false; 181]; 361];  
-    while let Ok((size, blob_header)) = read_blob_header(&mut buffered_file) {
-        n_bytes_read += size;
+    while parser.advance() {
+        println!("advanced");
+        if !matches!(parser.current.last(), Some((_, _, OSMStreamItem::Block(_)))) {
+            println!("not a block");
+            continue;
+        }
         if n_blobs_read >= max_n_blobs {
             break;
         }
-        println!("Blob {:9}: Type: {}  Size: {}  Header size: {}", n_blobs_read, blob_header.r#type, blob_header.datasize, size);
-        let read_raw_blob = read_blob(&mut buffered_file, &blob_header);
-        if n_blobs_read < skip_n_blobs {
-            n_blobs_read += 1;
-            continue;
-        }
-        if let Ok((size, blob)) = read_raw_blob {
-            n_bytes_read += size;
-            println!("Uncompressed size: {}  Data type: {:?}", blob.raw_size(), match blob.data {
-                Some(osm::blob::Data::Raw(_)) => "raw",
-                Some(osm::blob::Data::ZlibData(_)) => "zlib",
-                Some(osm::blob::Data::Lz4Data(_)) => "lz4data",
-                Some(osm::blob::Data::LzmaData(_)) => "lzmadata",
-                Some(osm::blob::Data::ZstdData(_)) => "zstddata",
-                Some(osm::blob::Data::ObsoleteBzip2Data(_)) => "ObsoleteBzip2Data",
-                Some(_) => "unknown",
-                None => ""
-            });
-            let raw_size = blob.raw_size() as usize;
-            if let Some(osm::blob::Data::ZlibData(data)) = blob.data {
+        n_blobs_read += 1;
 
-                let bf = &mut buffered_file;
-                let mut decompressor = flate2::bufread::ZlibDecoder::new(bf);
-                let buf = [0 as u8;32];
-                std::io::Read::read(bf, &mut buf);
-                std::io::Read::read(&mut decompressor, &mut buf);
+        let blob = match parser.current.get(parser.current.len()-2) {
+            Some((_, _, OSMStreamItem::Blob(blob))) => blob,
+            _ => panic!("no header on stack?")
+        };
+        let block = match parser.current.last() {
+            Some((_, _, OSMStreamItem::Block(block))) => block,
+            _ => panic!("unreachable")
+        };
 
-                let mut decompressed = vec![0; raw_size]; 
-                std::io::Read::read_exact(&mut decompressor, &mut decompressed).expect("couldn't decompress bytes");
-                let osm_type: String = blob_header.r#type;
-                if osm_type == "OSMHeader" {
-                    let header = osm::HeaderBlock::decode(&decompressed as &[u8]).expect("couldn't read header block");
-                } else if osm_type == "OSMData" {
-                    // OSM wiki: A primitive block contains _all_ the information to decompress the entities it contains
-                    // -> I assume this means any referred IDs in relations/ways will be contained in this block
-                    let decoded_data = osm::PrimitiveBlock::decode(&decompressed as &[u8]).expect("couldn't read data block");
-                    let string_table: Vec<String> = decoded_data.stringtable.s.iter().map(|str| std::str::from_utf8(&str).expect("invalid string").to_string()).collect();
-                    let lat_offset = decoded_data.lat_offset();
-                    let lon_offset = decoded_data.lon_offset();
-                    let granularity = decoded_data.granularity();
-                    let coord_decode = |coord, offset| -> f64 {
-                        1e-9 * ((offset + (granularity as i64) * coord) as f64)
-                    };
-                    // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
-                    for group in decoded_data.primitivegroup.iter() {
-                        for node in &group.nodes {
-                            for (k, v) in node.keys.iter().zip(node.vals.iter()) {
-                                println!("{:?}: {:?}", k, v);
-                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-                            }
-                        }
-                        for way in &group.ways {
-                            for (k, v) in way.keys.iter().zip(way.vals.iter()) {
-                                println!("{:?}: {:?}", k, v);
-                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-                            }
-                        }
-                        for relation in &group.relations {
-                            for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
-                                println!("{:?}: {:?}", k, v);
-                                println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-                            }
-                        }
-                        if let Some(dense_nodes) = &group.dense {
-                            let mut kv_iter = dense_nodes.keys_vals.iter();
-                            let has_kv = dense_nodes.keys_vals.len() > 0;
-                            let mut last_lat: i64 = 0;
-                            let mut last_lon: i64 = 0;
-                            for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
-                                // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
-                                // Each node's tags are encoded in alternating <keyid> <valid>
-                                // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
-                                let mut kv = std::collections::HashMap::<&String, &String>::new();
-                                if has_kv {
-                                    while let Some(k) = kv_iter.next() {
-                                        if *k == 0 {
-                                            break;
-                                        }
-                                        let k = &string_table[*k as usize];
-                                        let v = &string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
-                                        kv.insert(k, v);
-                                    }
+        println!("Blob {:9}: Type: {}  Size: {}  Header size: {}", n_blobs_read, blob.header.r#type, blob.header.datasize, blob.raw_size);
+
+        println!("Uncompressed size: {}  Data type: {:?}", blob.header.datasize, match blob.compression {
+            OSMBlobCompression::Raw => "raw",
+            OSMBlobCompression::Zlib => "zlib",
+            _ => "unknown"
+        });
+
+        if blob.header.r#type == "OSMData" {
+            // OSM wiki: A primitive block contains _all_ the information to decompress the entities it contains
+            // -> I assume this means any referred IDs in relations/ways will be contained in this block
+            let string_table: &Vec<String> = &block.string_table;
+            let lat_offset = block.block.lat_offset();
+            let lon_offset = block.block.lon_offset();
+            let granularity = block.block.granularity();
+            let coord_decode = |coord, offset| -> f64 {
+                1e-9 * ((offset + (granularity as i64) * coord) as f64)
+            };
+            // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
+            for group in block.block.primitivegroup.iter() {
+                for node in &group.nodes {
+                    for (k, v) in node.keys.iter().zip(node.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                for way in &group.ways {
+                    for (k, v) in way.keys.iter().zip(way.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                for relation in &group.relations {
+                    for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                if let Some(dense_nodes) = &group.dense {
+                    let mut kv_iter = dense_nodes.keys_vals.iter();
+                    let has_kv = dense_nodes.keys_vals.len() > 0;
+                    let mut last_lat: i64 = 0;
+                    let mut last_lon: i64 = 0;
+                    for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
+                        // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
+                        // Each node's tags are encoded in alternating <keyid> <valid>
+                        // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
+                        let mut kv = std::collections::HashMap::<&String, &String>::new();
+                        if has_kv {
+                            while let Some(k) = kv_iter.next() {
+                                if *k == 0 {
+                                    break;
                                 }
-                                // raw_lat = x_2 - last_lat
-                                // raw_lat + last_lat = x_2
-                                let lat_i = last_lat + *raw_lat;
-                                let lon_i = last_lon + *raw_lon;
-                                let lat = coord_decode(lat_i, lat_offset);
-                                let lon = coord_decode(lon_i, lon_offset);
-                                has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
-                                //println!("{} {} {:?}", lat, lon, kv);
-                                last_lat = lat_i;
-                                last_lon = lon_i;
+                                let k = &string_table[*k as usize];
+                                let v = &string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
+                                kv.insert(k, v);
                             }
                         }
+                        // raw_lat = x_2 - last_lat
+                        // raw_lat + last_lat = x_2
+                        let lat_i = last_lat + *raw_lat;
+                        let lon_i = last_lon + *raw_lon;
+                        let lat = coord_decode(lat_i, lat_offset);
+                        let lon = coord_decode(lon_i, lon_offset);
+                        has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
+                        //println!("{} {} {:?}", lat, lon, kv);
+                        last_lat = lat_i;
+                        last_lon = lon_i;
                     }
                 }
             }
-        } else {
-            println!("error reading blob");
         }
         //buffered_file.seek_relative(blob_header.datasize as i64);
         n_blobs_read += 1;

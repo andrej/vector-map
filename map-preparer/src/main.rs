@@ -206,7 +206,7 @@ where RawT: std::io::BufRead + std::io::Seek
         let stack_top = self.current.last();
         match stack_top {
             // element at the top of the stack is completely parsed, pop it
-            Some((start_offset, total_size, _)) if start_offset + total_size >= self.n_bytes_read => {
+            Some((start_offset, total_size, _)) if self.n_bytes_read >= start_offset + total_size => {
                 self.current.pop();
                 true
             }
@@ -237,24 +237,32 @@ where RawT: std::io::BufRead + std::io::Seek
         }
     }
 
-    /// Read exactly `n` bytes into self.bytes, unless EOF occurs first, in
-    /// which case we read upto EOF and return the number of bytes read (<n)
-    fn _read_bytes_upto(&mut self, n: usize) -> Result<usize, OSMPBFParseError> {
+    /// Attempt to make `n` bytes available for reading in self.bytes. If the
+    /// internal cursor is not at the end of the available data by `n` or more,
+    /// no data is read; otherwise, we read only the amount needed. The only
+    /// case in which this function makes less than `n` bytes available for
+    /// reading is if we encounter EOF beforehand.
+    fn _read_bytes_upto(&mut self, mut n: usize) -> Result<usize, OSMPBFParseError> {
         let mut buf: Vec<u8> = vec![0; n];
         let mut i = 0;
-        let n_to_read = if self.max_len > 0 {
-            usize::min(n, self.max_len - self.n_bytes_read)
-        }  else {
-            n
-        };
-        while let Ok(n_read_this_iter) = std::io::Read::read(*self.in_stream.dyn_readable_inner(), &mut buf[i..n_to_read]) {
+        let n_remaining_in_buf = prost::bytes::Buf::remaining(&self.bytes);
+        if n < n_remaining_in_buf {
+            return Ok(n)
+        } else {
+            n -= n_remaining_in_buf;
+            i += n_remaining_in_buf;
+        }
+        if self.max_len > 0 {
+            n = usize::min( n, self.max_len - self.n_bytes_read)
+        }
+        while let Ok(n_read_this_iter) = std::io::Read::read(*self.in_stream.dyn_readable_inner(), &mut buf[i..n]) {
             if n_read_this_iter == 0 {
                 break;
             }
             i += n_read_this_iter;
         }
         self.n_bytes_read += i;
-        bytes::BufMut::put(&mut self.bytes, &buf[0..i]);
+        bytes::BufMut::put(&mut self.bytes, &buf[n_remaining_in_buf..i]);
         Ok(i)
     }
 
@@ -309,15 +317,16 @@ where RawT: std::io::BufRead + std::io::Seek
         // We decode only the first field (raw_size), followed by the metadata
         // of the second field, which will tell us which compression is used.
         // Since the field metadata can be up to 10 bytes (varint encoding) and
-        // the first field is a 4-byte integer, we read upto 24 bytes.
-        const SIZE_FIRST_TWO: usize = 24;
+        // the first field is also a varint up to 10 bytes in length, we read 
+        // upto 20 bytes.
+        const SIZE_FIRST_TWO: usize = 20;
         n_read += self._read_bytes_upto(SIZE_FIRST_TWO)?;
 
         // raw_size field
         let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;
-        assert!(field_tag == 1);
-        assert!(wire_type == prost::encoding::WireType::ThirtyTwoBit);
-        let raw_size = i32::decode(&mut self.bytes).map_err(OSMPBFParseError::new)?;
+        assert!(field_tag == 2);
+        assert!(wire_type == prost::encoding::WireType::Varint);
+        let raw_size: i64 = prost::encoding::decode_varint(&mut self.bytes).map_err(OSMPBFParseError::new)?.try_into().map_err(OSMPBFParseError::new)?;
 
         // oneof data
         let (field_tag, wire_type) = prost::encoding::decode_key(&mut self.bytes).map_err(OSMPBFParseError::new)?;

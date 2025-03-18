@@ -60,7 +60,31 @@ Plan:
    threads for each output to be produced
 */
 
-trait OSMStream : std::io::BufRead {} //+ std::io::Seek {}
+//struct RestrictedBufReader<'a, T> {
+//    inner: &'a mut T,
+//    buf: Box<[u8]>
+//}
+//
+//impl<'a, T> RestrictedBufReader<'a, T> {
+//    fn new(inner: &'a mut T, max_len: usize) {
+//        Self {
+//            inner: inner,
+//            buf: Box::new(vec![0 as u8; max_len])
+//        }
+//    }
+//}
+//
+//impl<'a, T> std::io::BufRead for RestrictedBufReader<'a, T> 
+//where T: std::io::BufReader
+//{
+//    fn fill_buf(&mut self) -> Result<&[u8]> {
+//        Err()
+//    }
+//
+//    fn consume(&mut self, amt: usize) {
+//
+//    }
+//}
 
 enum InStream<RawT> {
     None,
@@ -353,16 +377,45 @@ where RawT: std::io::BufRead + std::io::Seek
     fn read_header_block(&mut self) -> Result<bool, OSMPBFParseError> {
         let start_offset = self.n_bytes_read;
         let mut to_read: usize = 0;
+        let mut decompressed_size: usize = 0;
+        let mut compression: OSMBlobCompression = OSMBlobCompression::Raw;
         if let Some((_, _, OSMStreamItem::Blob(blob))) = self.current.last() {
+            // datasize is the *compressed* size
             to_read = blob.header.datasize.try_into().expect("blob datasize should be positive and fit into a usize");
+            
+            // raw_size is the *uncompressed* size
+            //to_read = blob.raw_size;
+            decompressed_size = blob.raw_size;
+
+            compression = blob.compression;
         } else {
             panic!("read_primitive_block expects a blob on the parsing stack")
         }
+
+        // FIXME
+        self._deactivate_decompression();
         let n_read = self._read_bytes_upto(to_read).expect("something went wrong reading");
-        if n_read != to_read {
-            panic!("fewer bytes read ({}) than announced in blob header ({})", n_read, to_read);
+        let mut cur_view = self.bytes.split();
+        let decompressor = compression.get_decompressor(&cur_view[..]);
+        let mut decompressed = vec![0 as u8; decompressed_size];
+        if let InStream::Zlib(mut decompressor) = decompressor {
+            std::io::Read::read_exact(&mut decompressor, &mut decompressed).expect("could not read");
         }
-        let header = osm::HeaderBlock::decode(&mut self.bytes).expect("couldn't read header block");
+        // FIXME
+
+
+        // let n_read = self._read_bytes_upto(to_read).expect("something went wrong reading");
+        // if n_read != to_read {
+        //     panic!("fewer bytes read ({}) than announced in blob header ({})", n_read, to_read);
+        // }
+
+        //
+
+        // FIXME
+        //let header = osm::HeaderBlock::decode(&mut self.bytes).expect("couldn't read header block");
+        let header = osm::HeaderBlock::decode(&decompressed[..]).expect("couldn't read header block");
+        // FIXME
+
         self.current.push((
             start_offset,
             to_read,

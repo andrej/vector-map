@@ -20,7 +20,8 @@ impl IntoDecompressor for osm::blob::Data {
     }
 }
 
-const STREAM_BUF_SIZE: usize = 8192; 
+const STREAM_BUF_MAX_HEADER_SIZE: usize = 64*1024; 
+const STREAM_BUF_MAX_BLOB_SIZE: usize = 32*1024*1024; 
 struct OSMStreamingReader<InStreamT> 
 where InStreamT: std::io::BufRead
 {
@@ -46,7 +47,7 @@ where InStreamT: std::io::BufRead
             in_stream: in_stream,
             n_bytes_read: 0,
             max_len: max_len,
-            bytes: bytes::BytesMut::with_capacity(STREAM_BUF_SIZE),
+            bytes: bytes::BytesMut::with_capacity(STREAM_BUF_MAX_BLOB_SIZE),
             current_blob_header: None,
             current_blob: None
         }
@@ -58,6 +59,7 @@ where InStreamT: std::io::BufRead
     /// case in which this function makes less than `n` bytes available for
     /// reading is if we encounter EOF beforehand.
     fn _read_bytes_upto(&mut self, mut n: usize) -> Result<usize, OSMPBFParseError> {
+        assert!(n < STREAM_BUF_MAX_BLOB_SIZE);
         let mut buf: Vec<u8> = vec![0; n];
         let mut i = 0;
         let n_remaining_in_buf = prost::bytes::Buf::remaining(&self.bytes);
@@ -149,7 +151,7 @@ use std::{cell::{RefCell, RefMut}, marker::PhantomData, rc::Rc};
 
 use map_preparer::osm;
 use plotters::style::SizeDesc;
-use prost::{bytes, Message};
+use prost::{bytes::{self, BytesMut}, Message};
 
 const BUFFER_SIZE: usize = 4096;
 
@@ -165,6 +167,15 @@ fn web_mercator(lat: f64, lon: f64) -> (u64, u64) {
         f64::floor(1.0/(2.0*PI) * f64::powi(2.0, zoom_level) * (PI - f64::ln(f64::tan(PI/4.0 + lat/2.0)))) as u64
     )
 }
+
+fn read_string_table(stringtable: &osm::StringTable) -> Vec<&str> {
+    let mut ret = Vec::with_capacity(stringtable.s.len());
+    for item in &stringtable.s {
+        ret.push(std::str::from_utf8(&item[..]).expect("invalid unicode string in stringtable"))
+    }
+    ret
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing input file path command line argument"));
@@ -179,9 +190,11 @@ fn main() -> std::io::Result<()> {
 
     let mut parser = OSMStreamingReader::new(buffered_file);
 
+    let mut buf = vec![0 as u8; STREAM_BUF_MAX_BLOB_SIZE];
+
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
     let mut has_something = [[false; 181]; 361];  
-    for (blob_header, blob_size, blob_stream) in parser {
+    for (blob_header, blob_size, mut blob_stream) in parser {
         if n_blobs_read >= max_n_blobs {
             break;
         }
@@ -189,71 +202,75 @@ fn main() -> std::io::Result<()> {
 
         println!("Blob {:9}:   Type: {}  Compressed Size: {}  Uncompressed Size: {}", n_blobs_read, blob_header.r#type, blob_header.datasize, blob_size);
 
-
         if blob_header.r#type == "OSMData" {
+            assert!(blob_size <= STREAM_BUF_MAX_BLOB_SIZE);
+            std::io::Read::read_exact(&mut blob_stream, &mut buf[0..blob_size]).expect("couldn't read raw primitive bytes");
+            let block = osm::PrimitiveBlock::decode(&buf[0..blob_size]).expect("couldn't decode primitive");
+
             // OSM wiki: A primitive block contains _all_ the information to decompress the entities it contains
             // -> I assume this means any referred IDs in relations/ways will be contained in this block
-            // let string_table: &Vec<String> = &block.string_table;
-            // let lat_offset = block.block.lat_offset();
-            // let lon_offset = block.block.lon_offset();
-            // let granularity = block.block.granularity();
-            // let coord_decode = |coord, offset| -> f64 {
-            //     1e-9 * ((offset + (granularity as i64) * coord) as f64)
-            // };
-            // // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
-            // for group in block.block.primitivegroup.iter() {
-            //     for node in &group.nodes {
-            //         for (k, v) in node.keys.iter().zip(node.vals.iter()) {
-            //             println!("{:?}: {:?}", k, v);
-            //             println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-            //         }
-            //     }
-            //     for way in &group.ways {
-            //         for (k, v) in way.keys.iter().zip(way.vals.iter()) {
-            //             println!("{:?}: {:?}", k, v);
-            //             println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-            //         }
-            //     }
-            //     for relation in &group.relations {
-            //         for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
-            //             println!("{:?}: {:?}", k, v);
-            //             println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-            //         }
-            //     }
-            //     if let Some(dense_nodes) = &group.dense {
-            //         let mut kv_iter = dense_nodes.keys_vals.iter();
-            //         let has_kv = dense_nodes.keys_vals.len() > 0;
-            //         let mut last_lat: i64 = 0;
-            //         let mut last_lon: i64 = 0;
-            //         for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
-            //             // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
-            //             // Each node's tags are encoded in alternating <keyid> <valid>
-            //             // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
-            //             let mut kv = std::collections::HashMap::<&String, &String>::new();
-            //             if has_kv {
-            //                 while let Some(k) = kv_iter.next() {
-            //                     if *k == 0 {
-            //                         break;
-            //                     }
-            //                     let k = &string_table[*k as usize];
-            //                     let v = &string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
-            //                     kv.insert(k, v);
-            //                 }
-            //             }
-            //             // raw_lat = x_2 - last_lat
-            //             // raw_lat + last_lat = x_2
-            //             let lat_i = last_lat + *raw_lat;
-            //             let lon_i = last_lon + *raw_lon;
-            //             let lat = coord_decode(lat_i, lat_offset);
-            //             let lon = coord_decode(lon_i, lon_offset);
-            //             has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
-            //             //println!("{} {} {:?}", lat, lon, kv);
-            //             last_lat = lat_i;
-            //             last_lon = lon_i;
-            //         }
-            //     }
-            // }
+            let string_table = read_string_table(&block.stringtable);
+            let lat_offset = block.lat_offset();
+            let lon_offset = block.lon_offset();
+            let granularity = block.granularity();
+            let coord_decode = |coord, offset| -> f64 {
+                1e-9 * ((offset + (granularity as i64) * coord) as f64)
+            };
+            // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
+            for group in block.primitivegroup.iter() {
+                for node in &group.nodes {
+                    for (k, v) in node.keys.iter().zip(node.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                for way in &group.ways {
+                    for (k, v) in way.keys.iter().zip(way.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                for relation in &group.relations {
+                    for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
+                        println!("{:?}: {:?}", k, v);
+                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    }
+                }
+                if let Some(dense_nodes) = &group.dense {
+                    let mut kv_iter = dense_nodes.keys_vals.iter();
+                    let has_kv = dense_nodes.keys_vals.len() > 0;
+                    let mut last_lat: i64 = 0;
+                    let mut last_lon: i64 = 0;
+                    for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
+                        // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
+                        // Each node's tags are encoded in alternating <keyid> <valid>
+                        // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
+                        let mut kv = std::collections::HashMap::<&str, &str>::new();
+                        if has_kv {
+                            while let Some(k) = kv_iter.next() {
+                                if *k == 0 {
+                                    break;
+                                }
+                                let k = string_table[*k as usize];
+                                let v = string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
+                                kv.insert(k, v);
+                            }
+                        }
+                        // raw_lat = x_2 - last_lat
+                        // raw_lat + last_lat = x_2
+                        let lat_i = last_lat + *raw_lat;
+                        let lon_i = last_lon + *raw_lon;
+                        let lat = coord_decode(lat_i, lat_offset);
+                        let lon = coord_decode(lon_i, lon_offset);
+                        has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
+                        //println!("{} {} {:?}", lat, lon, kv);
+                        last_lat = lat_i;
+                        last_lon = lon_i;
+                    }
+                }
+            }
         }
+
         //buffered_file.seek_relative(blob_header.datasize as i64);
     }
     println!("{} blobs read ({} bytes)", n_blobs_read, n_bytes_read);

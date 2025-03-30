@@ -4,6 +4,7 @@ Keeping track of release build performance:
 commit      comment                                 max_n_blobs     time
 f794dbdf515 non-streaming, decompress from buffer   64              2.21 s
 3d9ad8b     decode dense nodes, map latlon          64              2.69 s
+b34613a     decode nodes with new struct, map       64              4.17 s  (battery power)
 */
 
 trait IntoDecompressor {
@@ -147,7 +148,7 @@ where InStreamT: std::io::BufRead {
     }
 }
 
-use std::{cell::{RefCell, RefMut}, marker::PhantomData, rc::Rc};
+use std::{cell::{RefCell, RefMut}, iter::Map, marker::PhantomData, rc::Rc};
 
 use map_preparer::osm;
 use plotters::style::SizeDesc;
@@ -176,6 +177,72 @@ fn read_string_table(stringtable: &osm::StringTable) -> Vec<&str> {
     ret
 }
 
+#[derive(Eq, PartialEq, Hash)]
+struct GroupLocalOSMString<'a> {
+    string_table_id: usize,
+    // Below is to ensure that the index above lives for as long as the string
+    // table it references
+    _marker: std::marker::PhantomData<&'a ()>
+}
+
+impl<'a> GroupLocalOSMString<'a> {
+    fn from_index(string_table: &'a Vec<&str>, index: usize) -> GroupLocalOSMString<'a> {
+        assert!(index < string_table.len());
+        Self {
+            string_table_id: index,
+            _marker: std::marker::PhantomData
+        }
+    }
+
+    fn from_string(string_table: &'a Vec<&str>, string: &str) -> Option<GroupLocalOSMString<'a>> {
+        string_table.iter()
+            .position(|x| *x == string)
+            .map(|index| {
+                Self {
+                    string_table_id: index,
+                    _marker: std::marker::PhantomData
+                }
+            })
+    }
+
+    fn str(&self, string_table: &'a Vec<&str>) -> &'a str {
+        string_table[self.string_table_id]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Coord {
+    lat: f64,
+    lon: f64
+}
+
+fn kv_to_hashmap<'a>(string_table: &'a Vec<&str>, keys_vals: &Vec<i32>) -> std::collections::HashMap<GroupLocalOSMString<'a>, GroupLocalOSMString<'a>> {
+    // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
+    // Each node's tags are encoded in alternating <keyid> <valid>
+    // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
+    let mut kv_iter = keys_vals.iter();
+    let has_kv = keys_vals.len() > 0;
+    let mut kv = std::collections::HashMap::new();
+    if has_kv {
+        kv.reserve((keys_vals.len() + 1) / 2);
+        while let Some(k) = kv_iter.next() {
+            if *k == 0 {
+                break;
+            }
+            let k = GroupLocalOSMString::from_index(
+                &string_table, 
+                *k as usize
+            );
+            let v = GroupLocalOSMString::from_index(
+                &string_table, 
+                *kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize
+            );
+            kv.insert(k, v);
+        }
+    }
+    kv
+}
+
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing input file path command line argument"));
@@ -184,7 +251,6 @@ fn main() -> std::io::Result<()> {
 
     let mut buffer: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
     let mut n_blobs_read = 0;
-    let mut n_bytes_read: usize = 0;
     let skip_n_blobs = 0;
     let max_n_blobs = 64;
 
@@ -193,8 +259,11 @@ fn main() -> std::io::Result<()> {
     let mut buf = vec![0 as u8; STREAM_BUF_MAX_BLOB_SIZE];
 
     /// has_something[lon][lat] == 1 iff. something in the planet.pbf file is located between [lon,lon+1), and [lat,lat+1)
-    let mut has_something = [[false; 181]; 361];  
-    for (blob_header, blob_size, mut blob_stream) in parser {
+    //let mut has_something = [[false; 181]; 361];  
+    let mut nodes = std::collections::HashMap::<usize, Coord>::new(); 
+    let mut lines = Vec::<Vec<Coord>>::new();
+
+    for (blob_header, blob_size, mut blob_stream) in &mut parser {
         if n_blobs_read >= max_n_blobs {
             break;
         }
@@ -216,54 +285,46 @@ fn main() -> std::io::Result<()> {
             let coord_decode = |coord, offset| -> f64 {
                 1e-9 * ((offset + (granularity as i64) * coord) as f64)
             };
+
+
             // Each primitive group is one of Nodes, DenseNodes, Ways, Relations  -- not multiple
             for group in block.primitivegroup.iter() {
-                for node in &group.nodes {
-                    for (k, v) in node.keys.iter().zip(node.vals.iter()) {
-                        println!("{:?}: {:?}", k, v);
-                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-                    }
-                }
+
                 for way in &group.ways {
-                    for (k, v) in way.keys.iter().zip(way.vals.iter()) {
-                        println!("{:?}: {:?}", k, v);
-                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
+                    println!("found a way!");
+                    let mut new_line = Vec::<Coord>::new();
+                    new_line.reserve(way.refs.len());
+                    let mut last_reference: i64 = 0;
+                    for reference in &way.refs {
+                        let node_id: usize = (last_reference + reference).try_into().expect("must result in a positive integer node ID");
+                        assert!(nodes.contains_key(&node_id));
+                        new_line.push(nodes[&node_id]);
+                        last_reference = *reference;
                     }
                 }
-                for relation in &group.relations {
-                    for (k, v) in relation.keys.iter().zip(relation.vals.iter()) {
-                        println!("{:?}: {:?}", k, v);
-                        println!("{:?}: {:?}", string_table[*k as usize], string_table[*v as usize]);
-                    }
-                }
+
+                //for relation in &group.relations {
+                //}
+
+                //for node in &group.nodes {
+                //}
+
                 if let Some(dense_nodes) = &group.dense {
-                    let mut kv_iter = dense_nodes.keys_vals.iter();
-                    let has_kv = dense_nodes.keys_vals.len() > 0;
+                    nodes.reserve(dense_nodes.id.len());
+
+                    let mut last_id: i64 = 0;
                     let mut last_lat: i64 = 0;
                     let mut last_lon: i64 = 0;
-                    for (raw_lat, raw_lon) in dense_nodes.lat.iter().zip(dense_nodes.lon.iter()) {
-                        // OSM wiki: index=0 is used as a delimiter when encoding DenseNodes
-                        // Each node's tags are encoded in alternating <keyid> <valid>
-                        // As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty
-                        let mut kv = std::collections::HashMap::<&str, &str>::new();
-                        if has_kv {
-                            while let Some(k) = kv_iter.next() {
-                                if *k == 0 {
-                                    break;
-                                }
-                                let k = string_table[*k as usize];
-                                let v = string_table[*kv_iter.next().expect("kv iter not multiple of 2 length? key with no value?") as usize];
-                                kv.insert(k, v);
-                            }
-                        }
-                        // raw_lat = x_2 - last_lat
-                        // raw_lat + last_lat = x_2
+                    for (raw_id, (raw_lat, raw_lon)) in dense_nodes.id.iter().zip(dense_nodes.lat.iter().zip(dense_nodes.lon.iter())) {
+                        let id = last_id + *raw_id;
                         let lat_i = last_lat + *raw_lat;
                         let lon_i = last_lon + *raw_lon;
                         let lat = coord_decode(lat_i, lat_offset);
                         let lon = coord_decode(lon_i, lon_offset);
-                        has_something[(lon as isize + 180) as usize][(lat as isize + 90) as usize] = true;
-                        //println!("{} {} {:?}", lat, lon, kv);
+                        if let Some(x) = nodes.insert(id as usize, Coord { lat, lon }) {
+                            println!("duplicate entry for {}", id);
+                        }
+                        last_id = id;
                         last_lat = lat_i;
                         last_lon = lon_i;
                     }
@@ -271,36 +332,62 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        //buffered_file.seek_relative(blob_header.datasize as i64);
     }
-    println!("{} blobs read ({} bytes)", n_blobs_read, n_bytes_read);
-    plot(&has_something);
+    println!("{} blobs read ({} bytes)", n_blobs_read, parser.n_bytes_read);
+    plot_points(&nodes);
+    //plot_lines(&lines);
     Ok(())
 }
 
-fn plot(has_something: &[[bool; 181]; 361]) {
+fn plot_points(points: &std::collections::HashMap<usize, Coord>) {
     use plotters::prelude::*;
 
-    let root_area = BitMapBackend::new("plot.png", (512, 512))
+    let width = 512;
+    let height = 512;
+
+    let root_area = BitMapBackend::new("plot.png", (width, height))
     .into_drawing_area();
     root_area.fill(&WHITE).unwrap();
     let mut ctx = ChartBuilder::on(&root_area).build_cartesian_2d(0..512, 0..512).unwrap();
     ctx.configure_mesh().draw().unwrap();
 
     ctx.draw_series(
-        has_something.iter().enumerate().filter_map(
-            |(lon, ps)| Some(ps.iter().enumerate().filter_map(
-                move |(lat, point)| {
-                    if *point {
-                        let (x, y) = web_mercator(f64::to_radians(lat as f64 - 90.0), f64::to_radians(lon as f64 - 180.0));
-                        Some(Circle::new((x as i32, y as i32), 1, &RED))
-                    } else {
-                        None
-                    }
-                }
-            ))
-        ).flatten()
+        points.iter().map(|(index, point)| { 
+            let (x, y) = web_mercator(f64::to_radians(point.lat), f64::to_radians(point.lon));
+            Circle::new(
+                (x as i32, y as i32),
+                1.0,
+                &BLACK
+            )
+        })
     ).unwrap(); 
+
+}
+
+fn plot_lines(lines: &Vec<Vec<Coord>>) {
+    use plotters::prelude::*;
+
+    let width = 512;
+    let height = 512;
+
+    let root_area = BitMapBackend::new("plot.png", (width, height))
+    .into_drawing_area();
+    root_area.fill(&WHITE).unwrap();
+    let mut ctx = ChartBuilder::on(&root_area).build_cartesian_2d(0..512, 0..512).unwrap();
+    ctx.configure_mesh().draw().unwrap();
+
+    for points in lines {
+        ctx.draw_series(
+            LineSeries::new(
+                points.iter().map(|point| {
+                    let (x, y) = web_mercator(f64::to_radians(point.lat), f64::to_radians(point.lon));
+                    (x as i32, y as i32)
+                }),
+                &BLACK
+            )
+        ).unwrap(); 
+    }
+
 }
 
 #[derive(Debug)]

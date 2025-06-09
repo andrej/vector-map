@@ -1,3 +1,6 @@
+.PHONY: map-preparer
+map-preparer:
+	$(MAKE) -C map-preparer map-preparer
 
 .PHONY: webapp
 webapp:

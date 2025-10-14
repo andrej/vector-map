@@ -5,7 +5,7 @@ use crate::potentially_compressed::{PotentiallyCompressedStream, CompressionType
 use bytes;
 use crate::protobuf_helpers::{decode_field, WireType};
 
-pub struct OsmStream<R: Read> {
+pub struct OsmStream<R: Read + Seek> {
     stream : PotentiallyCompressedStream<R>,
     state: OsmStreamState,
 }
@@ -21,12 +21,13 @@ enum OsmStreamState {
     ReadingBlobHeader,
     ReadingBlob(osm_pbf::BlobHeader),
     ReadingBlobData(usize),
+    ReadingHeaderBlock(usize),
     ReadingEntities,
     End
 }
 
 
-impl<R: Read> OsmStream<R> {
+impl<R: Read + Seek> OsmStream<R> {
     pub fn new(stream: R) -> Self {
         Self {
             stream: PotentiallyCompressedStream::from_uncompressed(stream),
@@ -59,6 +60,7 @@ impl<R: Read + Seek> OsmStream<R> {
             match self.state {
                 OsmStreamState::ReadingBlobHeader => { self.decode_blob_header()?; },
                 OsmStreamState::ReadingBlob(_) => { self.decode_blob_start()?; },
+                OsmStreamState::ReadingHeaderBlock(_) => { self.decode_header_block()?; }
                 _ => { }
             }
         };
@@ -112,30 +114,51 @@ impl<R: Read + Seek> OsmStream<R> {
                         7 => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unsupported compression type")),
                         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field ({}) in Blob", field_number))),
                     }
-                    self.stream.seek(std::io::SeekFrom::Current(len as i64))?;
+                    //self.stream.seek(std::io::SeekFrom::Current(len as i64))?;
                 }
                 _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unexpected field in Blob")),
             }
         }
 
-        match data_type {
-            None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing data_type field in Blob")),
-            Some(CompressionType::None) => {
-                let header = match self.state {
-                    OsmStreamState::ReadingBlob(ref header) => header,
-                    _ => panic!("Expected state to be ReadingBlob"),
-                };
-                self.state = OsmStreamState::ReadingBlobData(header.datasize as usize);
-            }
-            Some(CompressionType::Zlib) => {
-                self.stream.switch_compression(CompressionType::Zlib, raw_size.unwrap() as usize);
-                self.state = OsmStreamState::ReadingBlobData(raw_size.unwrap() as usize);
-            },
-            _ => panic!("Unsupported compression type"),
+        let header = match self.state {
+            OsmStreamState::ReadingBlob(ref header) => header,
+            _ => panic!("Expected state to be ReadingBlob"),
+        };
+
+        let size = 
+            match data_type {
+                None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing data_type field in Blob")),
+                Some(CompressionType::None) => {
+                    header.datasize as usize
+                }
+                Some(CompressionType::Zlib) => {
+                    self.stream.switch_compression(CompressionType::Zlib, raw_size.unwrap() as usize);
+                    raw_size.unwrap() as usize
+                },
+                _ => panic!("Unsupported compression type"),
+            };
+
+        if header.r#type == "OSMHeader" {
+            self.state = OsmStreamState::ReadingHeaderBlock(size);
         }
 
         println!("Decoded Blob start: raw_size={:?}, data_type={:?}", raw_size, data_type);
 
         Ok((raw_size, data_type))
     }
+
+    pub fn decode_header_block(&mut self) -> Result<(), std::io::Error> {
+        let size = match self.state {
+            OsmStreamState::ReadingHeaderBlock(size) => size,
+            _ => panic!("Expected state to be ReadingBlobData"),
+        };
+        self.stream.ensure_bytes(size)?;
+        let header_block = osm_pbf::HeaderBlock::decode(bytes::Buf::take(&mut self.stream.bytes, size))?;
+        println!("Decoded HeaderBlock: {:?}", header_block);
+
+        // After reading the header block, we expect to read entities next
+        self.state = OsmStreamState::ReadingEntities;
+        Ok(())
+    }
+
 }

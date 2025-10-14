@@ -5,7 +5,7 @@ use flate2::read::ZlibDecoder;
 pub struct PotentiallyCompressedStream<R: Read> {
     pub bytes: VecDeque<u8>,
     stream: PotentiallyCompressedStreamState<R>,
-    compressed_stream_remaining: usize,
+    remaining_compressed: usize,
 }
 
 pub enum PotentiallyCompressedStreamState<R: Read> {
@@ -26,23 +26,23 @@ pub enum CompressionType {
 
 const READ_CHUNK_SIZE: usize = 8192;
 
-impl<R: Read> PotentiallyCompressedStream<R> {
+impl<R: Read + Seek> PotentiallyCompressedStream<R> {
     pub fn from_uncompressed(stream: R) -> Self {
         Self {
             bytes: VecDeque::with_capacity(READ_CHUNK_SIZE),
             stream: PotentiallyCompressedStreamState::Uncompressed(stream),
-            compressed_stream_remaining: 0,
+            remaining_compressed: 0,
         }
     }
 
     /// Ensures that `self.bytes` contains at least `n` bytes, reading from the stream as needed.
     pub fn ensure_bytes(&mut self, n: usize) -> std::io::Result<()> {
-        if self.compressed_stream_remaining > 0 && n > self.compressed_stream_remaining {
+        if self.remaining_compressed > 0 && n > self.remaining_compressed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 format!(
                     "Not enough bytes in compressed stream (have {}, need {})",
-                    self.compressed_stream_remaining, n
+                    self.remaining_compressed, n
                 ),
             ));
         }
@@ -51,9 +51,9 @@ impl<R: Read> PotentiallyCompressedStream<R> {
             let n_to_read = std::cmp::max(n_remaining, READ_CHUNK_SIZE);
             let mut buf = vec![0u8; n_to_read];
             let n_read = self.read(&mut buf)?;
-            if self.compressed_stream_remaining > 0 {
-                self.compressed_stream_remaining -= n_read;
-                if self.compressed_stream_remaining == 0 {
+            if self.remaining_compressed > 0 {
+                self.remaining_compressed -= n_read;
+                if self.remaining_compressed == 0 {
                     self.switch_compression(CompressionType::None, 0);
                 }
             }
@@ -65,7 +65,7 @@ impl<R: Read> PotentiallyCompressedStream<R> {
         if self.bytes.len() < n {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof, 
-                format!("Not enough bytes in stream (have {}, need{})", self.bytes.len(), n))
+                format!("Not enough bytes in stream (have {}, need {})", self.bytes.len(), n))
             );
         }
         Ok(())
@@ -86,12 +86,22 @@ impl<R: Read> PotentiallyCompressedStream<R> {
         self.bytes.drain(0..m);
         Ok(())
     }
+}
 
+impl<R: Read + Seek> PotentiallyCompressedStream<R> {
     /// Switch compression type.
     pub fn switch_compression(&mut self, kind: CompressionType, n: usize) {
-        // A potential future optimization would be to decompress the already-read bytes and writing them back to self.bytes here, rather than discarding them.
+        // If there are buffered bytes, rewind the stream by that amount.
+        if !self.bytes.is_empty() {
+            let rewind_by = self.bytes.len() as i64;
+            if let PotentiallyCompressedStreamState::Uncompressed(reader) = &mut self.stream {
+                reader.seek(std::io::SeekFrom::Current(-rewind_by)).expect("Failed to rewind stream");
+            } else {
+                panic!("Must consume all buffered bytes before switching compression on a compressed stream");
+            }
+        }
         self.bytes.clear();
-        self.compressed_stream_remaining = n;
+        self.remaining_compressed = n;
         match kind {
             CompressionType::None => {
                 self.stream = std::mem::take(&mut self.stream).into_uncompressed();

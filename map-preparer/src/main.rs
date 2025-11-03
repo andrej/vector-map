@@ -1,5 +1,5 @@
 
-mod potentially_compressed;
+mod partially_compressed;
 mod osm_stream;
 mod osm_pbf;
 mod protobuf_helpers;

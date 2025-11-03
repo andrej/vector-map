@@ -1,8 +1,4 @@
-// Basic decoding functions for reading protobuf messages from a byte stream (Buf).
-// We use these for manually decoding protobuf messages when we need to do a partial decode, since prost does not support partially decoding messages.
-use std::io::{Read, Seek};
-use crate::potentially_compressed::PotentiallyCompressedStream;
-use bytes::Buf;
+use std::io::Read;
 
 #[derive(Debug)]
 pub enum WireType {
@@ -14,49 +10,106 @@ pub enum WireType {
     Fixed32(u32),
 }
 
-/// Decodes a field from a protobuf message, returning the field number and wire type.
-/// For all types except length-delimited, the value is decoded. 
-/// For length-delimited, we only read and return the length and leave the stream state at the beginning of the data.
-pub fn decode_field<T: Read + Seek>(stream: &mut PotentiallyCompressedStream<T>) -> Result<(u32, WireType), std::io::Error> {
-    let key = decode_varint(stream)?;
+/// Decode a protobuf field key and its value (for non-length-delimited types we fully
+/// consume the value; for length-delimited we consume only the length varint and leave
+/// the reader positioned at the start of the data).
+///
+/// On EOF before any bytes were read this returns Ok(None). On success returns Ok(Some(bytes_consumed)).
+pub fn decode_field<R: Read>(stream: &mut R, out_field_number: &mut u32, out_wire: &mut WireType) -> Result<Option<usize>, std::io::Error> {
+    // Read key varint
+    let mut key = 0u64;
+    let key_bytes = match decode_varint(stream, &mut key)? {
+        Some(k) => k,
+        None => return Ok(None),
+    };
     let field_number = (key >> 3) as u32;
     let wire_type = (key & 0x07) as u8;
-    let value = match wire_type {
-        0 => WireType::Varint(decode_varint(stream)?),
-        1 => WireType::Fixed64(decode_fixed64(stream)?),
-        2 => {
-            let len = decode_varint(stream)?;
-            WireType::LengthDelimited(len)
-        },
-        3 => WireType::StartGroup,
-        4 => WireType::EndGroup,
-        5 => WireType::Fixed32(decode_fixed32(stream)?),
+
+    let mut total = key_bytes;
+
+    match wire_type {
+        0 => { // varint
+            let mut v = 0u64;
+            let v_bytes = match decode_varint(stream, &mut v)? {
+                Some(b) => b,
+                None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF while reading varint value")),
+            };
+            *out_wire = WireType::Varint(v);
+            total += v_bytes;
+        }
+        1 => { // 64-bit
+            let mut v = 0u64;
+            let v_bytes = decode_fixed64(stream, &mut v)?;
+            *out_wire = WireType::Fixed64(v);
+            total += v_bytes;
+        }
+        2 => { // length-delimited: read length (varint) and leave data unread
+            let mut len = 0u64;
+            let len_bytes = match decode_varint(stream, &mut len)? {
+                Some(b) => b,
+                None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF while reading length-delimited length")),
+            };
+            *out_wire = WireType::LengthDelimited(len);
+            total += len_bytes;
+        }
+        3 => { *out_wire = WireType::StartGroup; }
+        4 => { *out_wire = WireType::EndGroup; }
+        5 => { // 32-bit
+            let mut v = 0u32;
+            let v_bytes = decode_fixed32(stream, &mut v)?;
+            *out_wire = WireType::Fixed32(v);
+            total += v_bytes;
+        }
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unknown wire type")),
-    };
-    Ok((field_number, value))
+    }
+
+    *out_field_number = field_number;
+    Ok(Some(total))
 }
 
-/// Decodes a protobuf varint from self.bytes.
-pub fn decode_varint<T: Read + Seek>(stream: &mut PotentiallyCompressedStream<T>) -> Result<u64, std::io::Error> {
+/// Decodes a protobuf varint from the stream into `out`.
+/// Returns Ok(None) if EOF was encountered before any byte was read.
+/// Otherwise returns Ok(Some(bytes_consumed)).
+pub fn decode_varint<R: Read>(stream: &mut R, out: &mut u64) -> Result<Option<usize>, std::io::Error> {
     let mut value = 0u64;
     let mut shift = 0;
-    loop {
-        stream.ensure_bytes(1)?;
-        let byte = Buf::get_u8(&mut stream.bytes);
+    let mut buf = [0u8; 1];
+    let mut consumed = 0usize;
+
+    for _ in 0..10 {
+        let n_read = stream.read(&mut buf)?;
+        if n_read == 0 {
+            if consumed == 0 {
+                return Ok(None);
+            } else {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF reached in the middle of varint"));
+            }
+        }
+        consumed += n_read;
+        let byte = buf[0];
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 { break; }
         shift += 7;
-        if shift > 63 { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed varint: too long")); }
+        if shift > 63 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Malformed varint: too long"));
+        }
     }
-    Ok(value)
+    *out = value;
+    Ok(Some(consumed))
 }
 
-pub fn decode_fixed64<T: Read + Seek>(stream: &mut PotentiallyCompressedStream<T>) -> Result<u64, std::io::Error> {
-    stream.ensure_bytes(8)?;
-    Ok(Buf::get_u64_le(&mut stream.bytes))
+/// Read 8 bytes (little-endian) into `out` and return number of bytes consumed (8) on success.
+pub fn decode_fixed64<R: Read>(stream: &mut R, out: &mut u64) -> Result<usize, std::io::Error> {
+    let mut buf = [0u8; 8];
+    stream.read_exact(&mut buf)?;
+    *out = u64::from_le_bytes(buf);
+    Ok(8)
 }
 
-pub fn decode_fixed32<T: Read + Seek>(stream: &mut PotentiallyCompressedStream<T>) -> Result<u32, std::io::Error> {
-    stream.ensure_bytes(4)?;
-    Ok(Buf::get_u32_le(&mut stream.bytes))
+/// Read 4 bytes (little-endian) into `out` and return number of bytes consumed (4) on success.
+pub fn decode_fixed32<R: Read>(stream: &mut R, out: &mut u32) -> Result<usize, std::io::Error> {
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf)?;
+    *out = u32::from_le_bytes(buf);
+    Ok(4)
 }

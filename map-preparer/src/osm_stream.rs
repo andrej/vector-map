@@ -91,7 +91,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut header_buf = vec![0u8; header_size];
         self.stream.read_exact(&mut header_buf)?;
         let blob_header = osm_pbf::BlobHeader::decode(&header_buf[..])?;
-        println!("Header size: {}", header_size);
         println!("Decoded BlobHeader: {:?}", blob_header);
 
         self.state = OsmStreamState::ReadingBlob(blob_header);
@@ -183,9 +182,9 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         println!("Decoded Blob start: data_type={:?}, compressed_data_len={:?}, uncompressed_data_len={:?}", compression_type, compressed_data_len, uncompressed_data_len);
 
         if header.r#type == "OSMHeader" {
-            self.state = OsmStreamState::ReadingHeaderBlock(header.datasize as usize, raw_size_field_skip_len);
+            self.state = OsmStreamState::ReadingHeaderBlock(uncompressed_data_len.unwrap() as usize, raw_size_field_skip_len);
         } else if header.r#type == "OSMData" {
-            self.state = OsmStreamState::ReadingBlobData(header.datasize as usize, raw_size_field_skip_len);
+            self.state = OsmStreamState::ReadingBlobData(uncompressed_data_len.unwrap() as usize, raw_size_field_skip_len);
         } else {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unknown Blob type: {}", header.r#type)));
         }
@@ -214,6 +213,11 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             OsmStreamState::ReadingBlobData(size, skip_at_end) => (size, skip_at_end),
             _ => panic!("Expected state to be ReadingBlobData"),
         };
+
+        let mut data_buf = vec![0u8; size];
+        self.stream.read_exact(&mut data_buf)?;
+        let data_block = osm_pbf::PrimitiveBlock::decode(&data_buf[..])?;
+
         // Seek to next message and expect to read blob header next
         self.stream.seek(std::io::SeekFrom::Current(skip_at_end as i64))?;
         self.state = OsmStreamState::ReadingBlobHeader;

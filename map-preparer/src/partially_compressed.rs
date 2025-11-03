@@ -96,9 +96,6 @@ impl<R: Read + BufRead> PartiallyCompressedStreamReader<R> {
     pub fn into_uncompressed(self) -> PartiallyCompressedStreamReader<R> {
         if let PartiallyCompressedStreamReader::ZlibCompressed(decoder) = self {
             let inner_limited: std::io::Take<R> = decoder.into_inner();
-            if inner_limited.limit() != 0 {
-                panic!("into_uncompressed called but not all compressed data was consumed ({} bytes remaining)", inner_limited.limit());
-            }
             return PartiallyCompressedStreamReader::Uncompressed(inner_limited.into_inner())
         }
         panic!("into_uncompressed called on a stream that is not ZlibCompressed");

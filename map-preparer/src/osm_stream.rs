@@ -1,10 +1,11 @@
-use std::io::{Read, Seek, BufRead, BufReader};
+use std::io::{Read, Seek, BufRead};
 use crate::osm_pbf;
 use prost::Message;
+use tracing::{span, trace, Level};
 use crate::partially_compressed::PartiallyCompressedStream;
-use bytes;
 use crate::protobuf_helpers::{decode_field, WireType};
 
+#[derive(Debug)]
 pub struct OsmStream<R: Read + BufRead> {
     stream : PartiallyCompressedStream<R>,
     state: OsmStreamState,
@@ -47,14 +48,12 @@ impl<R: Read + BufRead> OsmStream<R> {
     }
 }
 
-const CHUNK_SIZE: usize = 8192;
-
 impl OsmStream<std::io::BufReader<std::fs::File>> {
     pub fn from_file(path : &std::path::Path) -> std::io::Result<Self> {
         // Note: It is critical that the BufReader is _inside_ the PotentiallyCompressedStream;
         // this ensures that buffering works correctly even when switching between compressed and uncompressed reads.
         // (Otherwise, the BufReader may buffer compressed data as uncompressed because it does not know at what point in the stream we will "switch on" the compression.)
-        let file = std::io::BufReader::with_capacity(CHUNK_SIZE, std::fs::File::open(path)?);
+        let file = std::io::BufReader::new(std::fs::File::open(path)?);
         Ok(Self::new(file))
     }
 }
@@ -82,16 +81,17 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
     }
 
     fn decode_blob_header(&mut self) -> Result<(), std::io::Error> {
-        println!("Decoding BlobHeader");
+        let _span = span!(Level::TRACE, "decode_blob_header").entered();
+
         let mut size_buf = [0u8; 4];
         self.stream.read_exact(&mut size_buf)?;
         let header_size = u32::from_be_bytes(size_buf) as usize;
-        println!("Header size: {}", header_size);
+        trace!("Header size: {}", header_size);
 
         let mut header_buf = vec![0u8; header_size];
         self.stream.read_exact(&mut header_buf)?;
         let blob_header = osm_pbf::BlobHeader::decode(&header_buf[..])?;
-        println!("Decoded BlobHeader: {:?}", blob_header);
+        trace!("Decoded BlobHeader: {:?}", blob_header);
 
         self.state = OsmStreamState::ReadingBlob(blob_header);
         Ok(())
@@ -103,7 +103,9 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
 
     /// Read the first part of a Blob message (raw_size and compression type).
     /// We implement this manually because prost cannot decode partial messages, but we only want the start to be able to read sequentially from the compressed stream after this.
-    pub fn decode_blob_start(&mut self) -> Result<(), std::io::Error> {
+    fn decode_blob_start(&mut self) -> Result<(), std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_blob_start").entered();
+
         let mut compression_type = None;
         let mut compressed_data_len: Option<u64> = None;
         let mut data_start_pos: Option<u64> = None;
@@ -179,7 +181,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             _ => panic!("Unsupported compression type"),
         };
 
-        println!("Decoded Blob start: data_type={:?}, compressed_data_len={:?}, uncompressed_data_len={:?}", compression_type, compressed_data_len, uncompressed_data_len);
+        trace!("Decoded Blob start: data_type={:?}, compressed_data_len={:?}, uncompressed_data_len={:?}", compression_type, compressed_data_len, uncompressed_data_len);
 
         if header.r#type == "OSMHeader" {
             self.state = OsmStreamState::ReadingHeaderBlock(uncompressed_data_len.unwrap() as usize, raw_size_field_skip_len);
@@ -192,7 +194,9 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         Ok(())
     }
 
-    pub fn decode_header_block(&mut self) -> Result<(), std::io::Error> {
+    fn decode_header_block(&mut self) -> Result<(), std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_header_block").entered();
+
         let (size, skip_at_end) = match self.state {
             OsmStreamState::ReadingHeaderBlock(size, skip_at_end) => (size, skip_at_end),
             _ => panic!("Expected state to be ReadingBlobData"),
@@ -200,7 +204,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut header_buf = vec![0u8; size];
         self.stream.read_exact(&mut header_buf)?;
         let header_block = osm_pbf::HeaderBlock::decode(&header_buf[..])?;
-        println!("Decoded HeaderBlock: {:?}", header_block);
+        trace!("Decoded HeaderBlock: {:?}", header_block);
 
         // Seek to next message and expect to read blob header next
         self.stream.seek(std::io::SeekFrom::Current(skip_at_end as i64))?;
@@ -208,7 +212,9 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         Ok(())
     }
 
-    pub fn decode_blob_data(&mut self) -> Result<(), std::io::Error> {
+    fn decode_blob_data(&mut self) -> Result<(), std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_blob_data").entered();
+
         let (size, skip_at_end) = match self.state {
             OsmStreamState::ReadingBlobData(size, skip_at_end) => (size, skip_at_end),
             _ => panic!("Expected state to be ReadingBlobData"),

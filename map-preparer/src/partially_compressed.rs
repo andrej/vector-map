@@ -6,6 +6,7 @@ use flate2::bufread::ZlibDecoder;
 // PartiallyCompressedStream
 // --------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct PartiallyCompressedStream<R: Read + BufRead> {
     stream: PartiallyCompressedStreamReader<R>,
 }
@@ -79,6 +80,7 @@ impl<R: Read + BufRead + Seek> Seek for PartiallyCompressedStream<R> {
 // PartiallyCompressedStreamReader
 // --------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub enum PartiallyCompressedStreamReader<R: Read + BufRead> {
     Uninitialized,
     Uncompressed(R),

@@ -1,3 +1,4 @@
 2025-11-04,    6dffb8d,    "cargo run --release -p map-preparer ./planet-250526.osm.pbf -b",    ~ 3220 MiB/s for 100%
 2025-11-04,    6dffb8d,    "cargo run --release -p map-preparer ./planet-250526.osm.pbf",       ~  131 MiB/s
 2025-11-04,    6dffb8d,    "cargo run -p map-preparer ./planet-250526.osm.pbf",                 ~   20 MiB/s
+2025-11-05,    62664fb,    "cargo run --release -p map-preparer ./planet-250526.osm.pbf",       ~  140 MiB/s

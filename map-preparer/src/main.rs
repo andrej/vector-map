@@ -24,12 +24,24 @@ struct ClArgs {
     /// Buffer chunk size in bytes
     #[arg(short = 'c', long = "chunk-size", default_value_t = 8192)]
     chunk_size: usize,
+
+    /// Verbosity
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbosity: u8,
 }
 
 fn main() -> std::io::Result<()> {
-    let tracing_subscriber = FmtSubscriber::new();
-    tracing::subscriber::set_global_default(tracing_subscriber).expect("setting default tracing subscriber failed");
     let args = ClArgs::parse();
+
+    let tracing_subscriber = FmtSubscriber::builder().with_max_level(
+        match args.verbosity {
+            0 => tracing::Level::WARN,
+            1 => tracing::Level::INFO,
+            2 => tracing::Level::DEBUG,
+            _ => tracing::Level::TRACE,
+        }
+    ).finish();
+    tracing::subscriber::set_global_default(tracing_subscriber).expect("setting default tracing subscriber failed");
 
     let filename = std::path::Path::new(&args.osm_file);
     let file = std::fs::File::open(filename)?;

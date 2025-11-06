@@ -1,3 +1,6 @@
+// This entire file is entirely LLM-generated ...
+// pretty cool!
+
 use std::io::{self, Read, Seek, SeekFrom};
 
 /// Default callback frequency: 8 MiB

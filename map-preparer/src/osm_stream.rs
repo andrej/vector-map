@@ -129,37 +129,41 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut data_start_pos: Option<u64> = None;
         let mut uncompressed_data_len: Option<u64> = None;
 
-        // At most two fields in Blob (raw_size and data). Parse them directly from underlying stream.
-        // We rely on seeking to skip data bytes if raw_size comes after.
+        // Make sure the reader encounters EOF at the end of the Blob data (don't read into next blob)
+        let mut limited_reader = self.stream.by_ref().take(header.datasize as u64);
         let mut raw_size_field_skip_len = 0;
         let mut seek_back = false;
+
+        // There are at most two fields in the Blob message (raw_size and data)
+        // We will iterate, then break, until we hit the data field (ignoring raw_size if needed)
         for i in 0..=1 {
             let mut field_number: u32 = 0;
             let mut wire_type: WireType = WireType::Varint(0);
-            let n_read = match decode_field(&mut self.stream, &mut field_number, &mut wire_type)? {
+            let n_read = match decode_field(&mut limited_reader, &mut field_number, &mut wire_type)? {
                 Some(n) => n,
-                None => break,
+                None => break, // reached end of Blob message
             };
             match (field_number, wire_type) {
                 (2, WireType::Varint(raw_size)) => {
                     uncompressed_data_len = Some(raw_size);
                     if i == 1 {
+                        // The raw_size field follows _after_ the data; once done processing the data, we'll need to skip it to get to the next message
                         raw_size_field_skip_len = n_read;
                         seek_back = true;
                     }
-                }
+                },
                 (1..=7, WireType::LengthDelimited(len)) => {
                     data_field_number = Some(field_number);
                     compressed_data_len = Some(len);
-                    data_start_pos = Some(self.stream.seek(std::io::SeekFrom::Current(0))?);
+                    data_start_pos = Some(limited_reader.stream_position()?);
                     if i == 0 {
-                        // Skip over data to parse possible raw_size following; we'll seek back afterwards if needed.
-                        self.stream.seek(std::io::SeekFrom::Current(len as i64))?;
+                        // Raw_size field might still follow; skip over the data
+                        limited_reader.seek(std::io::SeekFrom::Current(len as i64))?;
                     }
-                }
+                },
                 (num, typ) => {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field in Blob: ({}, {:?})", num, typ)))
-                }
+                },
             }
         }
 

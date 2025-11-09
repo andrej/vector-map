@@ -25,6 +25,7 @@ enum OsmStreamState {
     #[default]
     Uninitialized,
     ReadingBlobHeader,
+    ReadingBlobStart(osm_pbf::BlobHeader),
     ReadingBlob {
         state: ReadingBlobState,
         size: usize,
@@ -35,29 +36,28 @@ enum OsmStreamState {
 
 #[derive(Debug)]
 enum ReadingBlobState {
-    Start(osm_pbf::BlobHeader),
     ReadingHeaderBlock,
     ReadingBlobData(ReadingBlobDataState),
-    End
+    End,
 }
 
 #[derive(Debug)]
 enum ReadingBlobDataState {
     Start,
-    DecodingStart,
     DecodingPrimitiveGroup {
         state: DecodingPrimitiveGroupState,
         heap: Vec<u8>,
         groups: VecDeque<(usize, usize)>,
         info: PrimitiveGroupInfo,
     },
-    Done,
+    End
 }
 
 #[derive(Debug)]
 enum DecodingPrimitiveGroupState {
-    Other,
+    Start,
     DecodingDenseNodes(usize, usize),
+    End,
 }
 
 #[derive(Debug)]
@@ -105,52 +105,70 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
     }
 
     fn decode_next(&mut self) -> Result<(), std::io::Error> {
-        match &self.state {
-            OsmStreamState::ReadingBlobHeader => { self.decode_blob_header()? },
-            OsmStreamState::ReadingBlob { state: ReadingBlobState::Start(_), .. } => { self.decode_blob_start()? },
-            OsmStreamState::ReadingBlob { state: ReadingBlobState::ReadingHeaderBlock, .. } => { self.decode_header_block()? },
-            OsmStreamState::ReadingBlob { state: ReadingBlobState::ReadingBlobData(ReadingBlobDataState::DecodingPrimitiveGroup { state: DecodingPrimitiveGroupState::DecodingDenseNodes(..), .. }), .. } => { self.decode_dense_nodes()? },
-            OsmStreamState::ReadingBlob { state: ReadingBlobState::ReadingBlobData(ReadingBlobDataState::DecodingPrimitiveGroup { .. }), .. } => { self.decode_primitive_group()? },
-            OsmStreamState::ReadingBlob { state: ReadingBlobState::ReadingBlobData(_), .. } => { self.decode_blob_data()? },
-            _ => { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cannot decode next in current state"))}
+        match &mut self.state {
+            OsmStreamState::ReadingBlobHeader => { 
+                self.state = Self::decode_blob_header(&mut self.stream)? 
+            },
+            OsmStreamState::ReadingBlobStart(header) => {
+                self.state = Self::decode_blob_start(&mut self.stream, header)?
+            },
+            OsmStreamState::ReadingBlob { state: reading_blob_state , size, skip_at_end } => match reading_blob_state {
+                ReadingBlobState::ReadingHeaderBlock => { 
+                    *reading_blob_state = Self::decode_header_block(&mut self.stream, *size)? 
+                },
+                ReadingBlobState::ReadingBlobData(reading_blob_data_state) => match reading_blob_data_state {
+                    ReadingBlobDataState::Start => { 
+                        *reading_blob_data_state = Self::decode_blob_data_start(&mut self.stream, *size)?;
+                    },
+                    ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap, groups, info } => match decoding_primitive_group_state {
+                        DecodingPrimitiveGroupState::Start => {
+                            *decoding_primitive_group_state = Self::decode_primitive_group(heap, groups)?;
+                        },
+                        DecodingPrimitiveGroupState::DecodingDenseNodes(start, end) => {
+                            *decoding_primitive_group_state = Self::decode_dense_nodes(heap, *start, *end)?;
+                        },
+                        DecodingPrimitiveGroupState::End => {
+                            *reading_blob_data_state = ReadingBlobDataState::End;
+                        }
+                    },
+                    ReadingBlobDataState::End => {
+                        *reading_blob_state = ReadingBlobState::End;
+                    }
+                },
+                ReadingBlobState::End => {
+                    // Seek to next message and expect to read blob header next
+                    self.stream.seek(std::io::SeekFrom::Current(*skip_at_end as i64))?;
+                    self.state = OsmStreamState::ReadingBlobHeader;
+                }
+            },
+            _ => { 
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cannot decode next in current state"))
+            }
         };
         Ok(())
     }
 
-    fn decode_blob_header(&mut self) -> Result<(), std::io::Error> {
+    fn decode_blob_header(stream: &mut PartiallyCompressedStream<R>) -> Result<OsmStreamState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_blob_header").entered();
 
         let mut size_buf = [0u8; 4];
-        self.stream.read_exact(&mut size_buf)?;
+        stream.read_exact(&mut size_buf)?;
         let header_size = u32::from_be_bytes(size_buf) as usize;
         trace!("Header size: {}", header_size);
 
         let mut header_buf = vec![0u8; header_size];
-        self.stream.read_exact(&mut header_buf)?;
+        stream.read_exact(&mut header_buf)?;
         let blob_header = osm_pbf::BlobHeader::decode(&header_buf[..])?;
         trace!("Decoded BlobHeader: {:?}", blob_header);
 
         // Update state
-        self.state = OsmStreamState::ReadingBlob {
-            state: ReadingBlobState::Start(blob_header),
-            size: 0,
-            skip_at_end: 0,
-        };
-
-        Ok(())
+        Ok(OsmStreamState::ReadingBlobStart(blob_header))
     }
 
     /// Read the first part of a Blob message (raw_size and compression type).
     /// We implement this manually because prost cannot decode partial messages, but we only want the start to be able to read sequentially from the compressed stream after this.
-    fn decode_blob_start(&mut self) -> Result<(), std::io::Error> {
+    fn decode_blob_start(stream: &mut PartiallyCompressedStream<R>, header: &osm_pbf::BlobHeader) -> Result<OsmStreamState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_blob_start").entered();
-
-        let OsmStreamState::ReadingBlob { state: reading_blob_state, size, skip_at_end } = &mut self.state else {
-            panic!("Not in ReadingBlob state");
-        };
-        let ReadingBlobState::Start(header) = &reading_blob_state else {
-            panic!("Not in ReadingBlob::Start state");
-        };
 
         let mut data_field_number = None;
         let mut compressed_data_len: Option<u64> = None;
@@ -158,7 +176,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut uncompressed_data_len: Option<u64> = None;
 
         // Make sure the reader encounters EOF at the end of the Blob data (don't read into next blob)
-        let mut limited_reader = self.stream.by_ref().take(header.datasize as u64);
+        let mut limited_reader = stream.by_ref().take(header.datasize as u64);
         let mut raw_size_field_skip_len = 0;
         let mut seek_back = false;
 
@@ -200,7 +218,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         }
         if seek_back {
             // The raw_size field follows the data; get back to it
-            self.stream.seek(std::io::SeekFrom::Start(data_start_pos.unwrap()))?;
+            stream.seek(std::io::SeekFrom::Start(data_start_pos.unwrap()))?;
         }
 
         match data_field_number {
@@ -212,7 +230,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                 if uncompressed_data_len.is_none() {
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Missing raw_size field in zlib-compressed Blob"));
                 }
-                self.stream.enable_zlib_compression(compressed_data_len.unwrap() as usize);
+                stream.enable_zlib_compression(compressed_data_len.unwrap() as usize);
             },
             _ => panic!("Unsupported compression type"),
         };
@@ -220,42 +238,38 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         trace!("Decoded Blob start: data_field_number={:?}, compressed_data_len={:?}, uncompressed_data_len={:?}", data_field_number, compressed_data_len, uncompressed_data_len);
 
         // Update state
-        *size = uncompressed_data_len.unwrap() as usize;
-        *skip_at_end = raw_size_field_skip_len;
-        *reading_blob_state = if header.r#type == "OSMHeader" {
-            Ok(ReadingBlobState::ReadingHeaderBlock)
+        let size = uncompressed_data_len.unwrap() as usize;
+        let skip_at_end = raw_size_field_skip_len;
+        if header.r#type == "OSMHeader" {
+            Ok(OsmStreamState::ReadingBlob {
+                state: ReadingBlobState::ReadingHeaderBlock,
+                size,
+                skip_at_end,
+            })
         } else if header.r#type == "OSMData" {
-            Ok(ReadingBlobState::ReadingBlobData(ReadingBlobDataState::Start))
+            Ok(OsmStreamState::ReadingBlob {
+                state: ReadingBlobState::ReadingBlobData(ReadingBlobDataState::Start),
+                size,
+                skip_at_end,
+            })
         } else {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unknown Blob type: {}", header.r#type)))
-        }?;
-
-        Ok(())
+        }
     }
 
-    fn decode_header_block(&mut self) -> Result<(), std::io::Error> {
-        let _span = span!(Level::TRACE, "decode_header_block").entered();
+    fn decode_header_block(stream: &mut PartiallyCompressedStream<R>, size: usize) -> Result<ReadingBlobState, std::io::Error> {
+        let _span: span::EnteredSpan = span!(Level::TRACE, "decode_header_block").entered();
 
-        let OsmStreamState::ReadingBlob { state: reading_blob_state, size, skip_at_end } = &mut self.state else {
-            panic!("Not in ReadingBlob state");
-        };
-        let ReadingBlobState::ReadingHeaderBlock = reading_blob_state else {
-            panic!("Not in ReadingHeaderBlock state");
-        };
-
-        let mut header_buf = vec![0u8; *size];
-        self.stream.read_exact(&mut header_buf)?;
+        let mut header_buf = vec![0u8; size];
+        stream.read_exact(&mut header_buf)?;
         let header_block = osm_pbf::HeaderBlock::decode(&header_buf[..])?;
         trace!("Decoded HeaderBlock: {:?}", header_block);
 
-        // Seek to next message and expect to read blob header next
-        self.stream.seek(std::io::SeekFrom::Current(*skip_at_end as i64))?;
-        self.state = OsmStreamState::ReadingBlobHeader;
-        Ok(())
+        Ok(ReadingBlobState::End)
     }
 
-    fn decode_blob_data(&mut self) -> Result<(), std::io::Error> {
-        let _span = span!(Level::TRACE, "decode_blob_data").entered();
+    fn decode_blob_data_start(stream: &mut PartiallyCompressedStream<R>, size: usize) -> Result<ReadingBlobDataState, std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_blob_data_start").entered();
         /*
             message PrimitiveBlock {
                 required StringTable stringtable = 1;
@@ -273,10 +287,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             }
         */
 
-        let OsmStreamState::ReadingBlob { state: reading_blob_state@ReadingBlobState::ReadingBlobData(..), size, skip_at_end } = &mut self.state else {
-            panic!("Not in ReadingBlob::ReadingBlobData state");
-        };
-
         // We want to first read the stringtable and the granularity and lat/lon offset fields (if any)
         // before starting to decode the PrimitiveGroup, as we'll need that info for decoding the entities.
         let mut stringtable: Option<osm_pbf::StringTable> = None;
@@ -288,18 +298,17 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut n_read: usize = 0;
         let mut field_number: u32 = 0;
         let mut wire_type: WireType = WireType::Varint(0);
-        let limited_stream = &mut self.stream.by_ref().take(*size as u64);
+        let limited_stream = &mut stream.by_ref().take(size as u64);
 
         // Heap to store decompressed bytes of all PrimitiveGroups
         // The size here is overprovisioned (includes stringtable and other fields), but that's probably better than to keep reallocating it for each primitivegroup we encounter
-        let mut heap: Vec<u8> = Vec::with_capacity(*size);
+        let mut heap: Vec<u8> = Vec::with_capacity(size);
         let mut groups: VecDeque<(usize, usize)> = VecDeque::new();
         let mut cur_group_start = 0;
 
         while let Some(n_read_this_iter) = decode_field(limited_stream, &mut field_number, &mut wire_type)? {
             n_read += n_read_this_iter;
-            trace!("Blob data field: number={}, wire_type={:?}", field_number, wire_type);
-            trace!("Total bytes read in Blob data so far: {}", n_read);
+            trace!("Blob data field: number={}, wire_type={:?}, n_read={:?}", field_number, wire_type, n_read);
             match (field_number, &wire_type) {
                 (1, WireType::LengthDelimited(len)) => { // stringtable
                     let mut stringtable_buf = vec![0u8; *len as usize];
@@ -329,12 +338,9 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected at least one PrimitiveGroup in Blob data"));
         }
 
-        // Advance stream past this blob (might have raw_size field after it to skip)
-        self.stream.seek(std::io::SeekFrom::Current(*skip_at_end as i64))?;
-
         // Update state
-        *reading_blob_state = ReadingBlobState::ReadingBlobData(ReadingBlobDataState::DecodingPrimitiveGroup {
-            state: DecodingPrimitiveGroupState::Other,
+       Ok(ReadingBlobDataState::DecodingPrimitiveGroup {
+            state: DecodingPrimitiveGroupState::Start,
             heap,
             groups,
             info: PrimitiveGroupInfo {
@@ -344,11 +350,10 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                 lon_offset,
                 date_granularity,
             },
-        });
-        Ok(())
+        })
     }
 
-    fn decode_primitive_group(&mut self) -> Result<(), std::io::Error> {
+    fn decode_primitive_group(heap: &Vec<u8>, groups: &mut VecDeque<(usize, usize)>) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         /*
             message PrimitiveGroup {
                 repeated Node nodes = 1;
@@ -360,16 +365,11 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
          */
         let _span = span!(Level::TRACE, "decode_primitive_group").entered();
 
-        let OsmStreamState::ReadingBlob { state: ReadingBlobState::ReadingBlobData(ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap, groups, .. }), .. } = &mut self.state else {
-            panic!("Not in ReadingBlob::ReadingBlobData::DecodingPrimitiveGroup state");
-        };
-
         // Pop the next PrimitiveGroup to decode, if any;
         // note that this also updates the state (groups shrinks by one, or if empty, we move to next blob header state)
         let Some((start, end)) = groups.pop_front() else {
             // After processing all groups, continue with the next blob header.
-            self.state = OsmStreamState::ReadingBlobHeader;
-            return Ok(())
+            return Ok(DecodingPrimitiveGroupState::End);
         };
 
         let mut field_number: u32 = 0;
@@ -380,40 +380,21 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         };
 
         match (field_number, &wire_type) {
-            (2, WireType::LengthDelimited(_)) => {
-                // Dense nodes
-                *decoding_primitive_group_state = DecodingPrimitiveGroupState::DecodingDenseNodes(start+n_read, end);
+            (2, WireType::LengthDelimited(_)) => { // Dense nodes
+                Ok(DecodingPrimitiveGroupState::DecodingDenseNodes(start+n_read, end))
             },
             _ => {
-                // Handle other cases or ignore
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field in PrimitiveGroup: ({}, {:?})", field_number, wire_type)))
             }
         }
-
-        Ok(())
     }
 
-    fn decode_dense_nodes(&mut self) -> Result<(), std::io::Error> {
+    fn decode_dense_nodes(heap: &Vec<u8>, start: usize, end: usize) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_dense_nodes").entered();
 
-        let OsmStreamState::ReadingBlob { 
-            state: ReadingBlobState::ReadingBlobData(
-                ReadingBlobDataState::DecodingPrimitiveGroup { 
-                    state: decoding_primitive_group_state@DecodingPrimitiveGroupState::DecodingDenseNodes(..), 
-                    heap, 
-                    info, 
-                    .. 
-                }
-            ), 
-            .. 
-        } = &mut self.state else {
-            panic!("Not in ReadingBlob::ReadingBlobData::DecodingPrimitiveGroup::DecodingDenseNodes state");
-        };
-
         // TODO: implement
-        *decoding_primitive_group_state = DecodingPrimitiveGroupState::Other;
-        Ok(())
+        Ok(DecodingPrimitiveGroupState::Start)
     }
-
 
     fn decode_entity(&mut self) -> Result<Option<OsmEntity>, std::io::Error> {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Not implemented yet"))

@@ -5,7 +5,9 @@ use prost::Message;
 use tracing::{Level, field, span, trace};
 use crate::partially_compressed::PartiallyCompressedStream;
 use crate::protobuf_helpers::{decode_field, WireType};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use bytes::{Bytes, BytesMut};  // Bytes are a shared reference slice to a reference-counted buffer; essentially &[u8] that enforces lifetimes at runtime
+// (Note we can't use static (compile-time) lifetimes for our use case, because the underlying buffer changes over time as we read data, so we have run-time "temporal" lifetimes, whereas Rust can only enforce lifetimes for a certain code scope, and the scopes needed to update the buffer and read the references would necessarily overlap.)
 
 #[derive(Debug)]
 pub struct OsmStream<R: Read + BufRead> {
@@ -14,11 +16,25 @@ pub struct OsmStream<R: Read + BufRead> {
 }
 
 #[derive(Debug)]
-pub enum OsmEntity {
-    Node(osm_pbf::Node),
-    Way(osm_pbf::Way),
-    Relation(osm_pbf::Relation),
+pub enum RawOsmEntity {
+    Node(RawOsmNode),
+    Way(RawOsmWay),
+    Relation(RawOsmRelation),
 }
+
+#[derive(Debug)]
+pub struct RawOsmNode {
+    pub id: u64,
+    pub lat: i64,
+    pub lon: i64,
+    pub kv: HashMap<Bytes, Bytes>
+}
+
+#[derive(Debug)]
+pub struct RawOsmWay {}
+
+#[derive(Debug)]
+pub struct RawOsmRelation {}
 
 #[derive(Debug, Default)]
 enum OsmStreamState {
@@ -46,8 +62,9 @@ enum ReadingBlobDataState {
     Start,
     DecodingPrimitiveGroup {
         state: DecodingPrimitiveGroupState,
-        heap: Vec<u8>,
-        groups: VecDeque<(usize, usize)>,
+        heap: Bytes,
+        groups: VecDeque<Bytes>,  // subslices of heap
+        string_table: Vec<Bytes>,  // subslices of heap
         info: PrimitiveGroupInfo,
     },
     End
@@ -56,20 +73,19 @@ enum ReadingBlobDataState {
 #[derive(Debug)]
 enum DecodingPrimitiveGroupState {
     Start,
-    DecodingDenseNodes(usize, usize),
+    DecodingDenseNodes(Bytes),
     End,
 }
 
 #[derive(Debug)]
 struct PrimitiveGroupInfo {
-    stringtable: osm_pbf::StringTable,
     granularity: i32,
     lat_offset: i64,
     lon_offset: i64,
     date_granularity: i32,
 }
 
-impl<R: Read + BufRead> OsmStream<R> {
+impl<'a, R: Read + BufRead> OsmStream<R> {
     pub fn new(stream: R) -> Self {
         Self {
             stream: PartiallyCompressedStream::from_uncompressed(stream),
@@ -89,7 +105,7 @@ impl OsmStream<std::io::BufReader<std::fs::File>> {
 }
 
 impl<R: Read + BufRead + Seek> OsmStream<R> {
-    fn decode_until_entity(&mut self) -> Result<Option<OsmEntity>, std::io::Error> {
+    fn decode_until_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {
         // If we're not currently reading entities, get into the "reading entities" state
         while match self.state {
             OsmStreamState::End => false,
@@ -120,12 +136,12 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                     ReadingBlobDataState::Start => { 
                         *reading_blob_data_state = Self::decode_blob_data_start(&mut self.stream, *size)?;
                     },
-                    ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap, groups, info } => match decoding_primitive_group_state {
+                    ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap, groups, string_table, info } => match decoding_primitive_group_state {
                         DecodingPrimitiveGroupState::Start => {
-                            *decoding_primitive_group_state = Self::decode_primitive_group(heap, groups)?;
+                            *decoding_primitive_group_state = Self::decode_primitive_group(groups)?;
                         },
-                        DecodingPrimitiveGroupState::DecodingDenseNodes(start, end) => {
-                            *decoding_primitive_group_state = Self::decode_dense_nodes(heap, *start, *end)?;
+                        DecodingPrimitiveGroupState::DecodingDenseNodes(slice) => {
+                            *decoding_primitive_group_state = Self::decode_dense_nodes(slice)?;
                         },
                         DecodingPrimitiveGroupState::End => {
                             *reading_blob_data_state = ReadingBlobDataState::End;
@@ -289,7 +305,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
 
         // We want to first read the stringtable and the granularity and lat/lon offset fields (if any)
         // before starting to decode the PrimitiveGroup, as we'll need that info for decoding the entities.
-        let mut stringtable: Option<osm_pbf::StringTable> = None;
         let mut granularity: i32 = 100;
         let mut lat_offset: i64 = 0;
         let mut lon_offset: i64 = 0;
@@ -300,29 +315,32 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut wire_type: WireType = WireType::Varint(0);
         let limited_stream = &mut stream.by_ref().take(size as u64);
 
-        // Heap to store decompressed bytes of all PrimitiveGroups
-        // The size here is overprovisioned (includes stringtable and other fields), but that's probably better than to keep reallocating it for each primitivegroup we encounter
-        let mut heap: Vec<u8> = Vec::with_capacity(size);
-        let mut groups: VecDeque<(usize, usize)> = VecDeque::new();
-        let mut cur_group_start = 0;
+        // Heap to store decompressed bytes of all PrimitiveGroups as well as the stringtable
+        // The size here is slightly overprovisioned (includes other fields), but that's probably better than to keep reallocating it for each primitivegroup we encounter
+        // We want to first read the stringtable and the granularity and lat/lon offset fields (if any)
+        // before starting to decode the PrimitiveGroup, as we'll need that info for decoding the entities.
+        let mut heap  = BytesMut::with_capacity(size);
+
+        let mut group_indices: VecDeque<std::ops::Range<usize>> = VecDeque::new();
+        let mut string_table_loc = None;
+        let mut cur_heap_offset = 0;
 
         while let Some(n_read_this_iter) = decode_field(limited_stream, &mut field_number, &mut wire_type)? {
             n_read += n_read_this_iter;
             trace!("Blob data field: number={}, wire_type={:?}, n_read={:?}", field_number, wire_type, n_read);
             match (field_number, &wire_type) {
-                (1, WireType::LengthDelimited(len)) => { // stringtable
-                    let mut stringtable_buf = vec![0u8; *len as usize];
-                    limited_stream.read_exact(&mut stringtable_buf)?;
-                    stringtable = Some(osm_pbf::StringTable::decode(&stringtable_buf[..])?);
-                },
-                (2, WireType::LengthDelimited(len)) => { // primitivegroup
-                    // Read raw bytes directly into the heap to avoid extra copies.
-                    let start = cur_group_start;
+                (1..=2, WireType::LengthDelimited(len)) => {
+                    let start = cur_heap_offset;
                     let end = start + *len as usize;
                     heap.resize(end, 0);
+                    // Read raw bytes directly into the heap to avoid extra copies.
                     limited_stream.read_exact(&mut heap[start..end])?;
-                    groups.push_back((start, end));
-                    cur_group_start = end;
+                    cur_heap_offset = end;
+                    if field_number == 1 { // stringtable
+                        string_table_loc = Some(start..end);
+                    } else if field_number == 2 { // primitivegroup
+                        group_indices.push_back(start..end);
+                    }
                 },
                 (17, WireType::Varint(val)) =>  granularity = *val as i32,
                 (19, WireType::Varint(val)) =>  lat_offset = *val as i64,
@@ -334,26 +352,41 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             }
         }
 
-        if groups.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected at least one PrimitiveGroup in Blob data"));
+        let heap = heap.freeze();
+
+        let mut string_table: Vec<Bytes> = Vec::new();
+        if let Some(range) = string_table_loc {
+            let string_table_heap = heap.slice(range.start..range.end);
+            for slice in string_table_heap.split(|&b| b == 0) {
+                //let s = std::str::from_utf8(slice)
+                //    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8 in string table: {e}")))?;
+                let substr_start_idx = range.start + (slice.as_ptr() as usize - string_table_heap.as_ptr() as usize);
+                let substr_end_idx = substr_start_idx + slice.len();
+                string_table.push(string_table_heap.slice(substr_start_idx..substr_end_idx));
+            }
         }
 
-        // Update state
-       Ok(ReadingBlobDataState::DecodingPrimitiveGroup {
+        let mut groups: VecDeque<Bytes> = VecDeque::new();
+        for range in group_indices {
+            let group_slice = heap.slice(range.start..range.end);
+            groups.push_back(group_slice);
+        }
+
+        Ok(ReadingBlobDataState::DecodingPrimitiveGroup {
             state: DecodingPrimitiveGroupState::Start,
-            heap,
-            groups,
+            heap: heap,
+            groups: groups,
+            string_table: string_table,
             info: PrimitiveGroupInfo {
-                stringtable: stringtable.expect("stringtable must be present"),
-                granularity,
-                lat_offset,
-                lon_offset,
-                date_granularity,
+                granularity: 100,
+                lat_offset: 0,
+                lon_offset: 0,
+                date_granularity: 1000,
             },
         })
     }
 
-    fn decode_primitive_group(heap: &Vec<u8>, groups: &mut VecDeque<(usize, usize)>) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
+    fn decode_primitive_group(groups: &mut VecDeque<Bytes>) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         /*
             message PrimitiveGroup {
                 repeated Node nodes = 1;
@@ -367,21 +400,21 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
 
         // Pop the next PrimitiveGroup to decode, if any;
         // note that this also updates the state (groups shrinks by one, or if empty, we move to next blob header state)
-        let Some((start, end)) = groups.pop_front() else {
+        let Some(mut slice) = groups.pop_front() else {
             // After processing all groups, continue with the next blob header.
             return Ok(DecodingPrimitiveGroupState::End);
         };
 
         let mut field_number: u32 = 0;
         let mut wire_type = WireType::Varint(0);
-        let mut slice_reader = &heap[start..end];
-        let Some(n_read) = decode_field(&mut slice_reader, &mut field_number, &mut wire_type)? else {
+        let Some(n_read) = decode_field(&mut (&slice as &[u8]), &mut field_number, &mut wire_type)? else {
             return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF while reading PrimitiveGroup field"));
         };
+        let subslice = slice.slice(n_read..);
 
         match (field_number, &wire_type) {
             (2, WireType::LengthDelimited(_)) => { // Dense nodes
-                Ok(DecodingPrimitiveGroupState::DecodingDenseNodes(start+n_read, end))
+                Ok(DecodingPrimitiveGroupState::DecodingDenseNodes(subslice))
             },
             _ => {
                 Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field in PrimitiveGroup: ({}, {:?})", field_number, wire_type)))
@@ -389,20 +422,22 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         }
     }
 
-    fn decode_dense_nodes(heap: &Vec<u8>, start: usize, end: usize) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
+    fn decode_dense_nodes(slice: &Bytes) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_dense_nodes").entered();
+
+        let mut entities: Vec<RawOsmEntity> = Vec::new();
 
         // TODO: implement
         Ok(DecodingPrimitiveGroupState::Start)
     }
 
-    fn decode_entity(&mut self) -> Result<Option<OsmEntity>, std::io::Error> {
+    fn decode_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Not implemented yet"))
     }
 }
 
 impl<R: Read + BufRead + Seek> Iterator for OsmStream<R> {
-    type Item = OsmEntity;
+    type Item = RawOsmEntity;
     fn next(&mut self) -> Option<Self::Item> {
         self.decode_until_entity().unwrap()
     }

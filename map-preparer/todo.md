@@ -1,11 +1,15 @@
 # Where I left off
 
-Working implementation that streams data from the file and switches compression on/off throughout the file.
+Working implementation that decodes up to the IDs of dense nodes.
+
+Issue at about ~14% of the file, decoding fails with an invalid field (field number 0).
 
 # Next steps
 
-- Nothing past `decode_blob_data()` is implemented; we need code that reads the StringTable and entities within the PrimitiveGroup.
-- Right now, `decode_blob_data()` decompresses and writes the whole PrimitiveGroup into a buffer. I'd rather do something similar to what we did for the Blob and read entities in a streaming fashion (constrain reader with `take()` to the length of the primitivegroup, then keep decoding individual Nodes etc. until no data is left).
+ - Decode remainder of fields in decode_dense_node_field
+ - Rewrite dense node decoder to use offsets into ids, lats, lons, kv, denseinfo fields and decode on the fly rather than append to a vector;
+   this should be cheap (without seeking) since the dense nodes are in-memory already anyways
+ - Fix the decoding error
 
 # Tests
 

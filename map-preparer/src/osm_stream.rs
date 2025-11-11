@@ -452,19 +452,20 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut state = DecodeDenseNodesFieldState::Start;
         loop {
             state = Self::decode_dense_nodes_field(slice_reader, state)?;
+            // Grow nodes to appropriate size
+            if let DecodeDenseNodesFieldState::Ids(idx, _, _) |
+                DecodeDenseNodesFieldState::Lats(idx, _, _) |
+                DecodeDenseNodesFieldState::Lons(idx, _, _) = state {
+                if idx >= nodes.len() {
+                    nodes.resize(idx + 1, RawOsmNode::default());
+                }
+            }
+            
             match state {
                 DecodeDenseNodesFieldState::End => break,
-                DecodeDenseNodesFieldState::Ids(idx, id, _) => {
-                    if idx >= nodes.len() {
-                        nodes.resize(idx + 1, RawOsmNode::default());
-                    }
-                    nodes[idx] = RawOsmNode {
-                        id,
-                        lat: 0,
-                        lon: 0,
-                        kv: HashMap::new(),
-                    };
-                }
+                DecodeDenseNodesFieldState::Ids(idx, id, _) => { nodes[idx].id = id; },
+                DecodeDenseNodesFieldState::Lats(idx, lat, _) => { nodes[idx].lat = lat; },
+                DecodeDenseNodesFieldState::Lons(idx, lon, _) => { nodes[idx].lon = lon; },
                 _ => {}
             }
         }
@@ -508,7 +509,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                 let n_read = decode_zigzag_varint(stream, &mut val)?;
                 // Signed addition because the delta might be negative; but unsigned result because IDs are always positive
                 let decoded = ((last as i64) + (val as i64)) as u64;
-                trace!("Decoded DenseNodes id: {}", decoded);
                 Ok(DecodeDenseNodesFieldState::Ids(idx + 1, decoded, len - n_read))
             },
             DecodeDenseNodesFieldState::DenseInfoStart(len) |
@@ -522,8 +522,22 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             DecodeDenseNodesFieldState::Lats(_, _, len) | 
             DecodeDenseNodesFieldState::Lons(_, _, len) => {
                 // Skip for now
-                *stream = &(*stream)[len..];
-                Ok(DecodeDenseNodesFieldState::Start)
+                let mut val: i64 = 0;
+                let (idx, last) = if let DecodeDenseNodesFieldState::Ids(idx, last, _) = state { (idx, last) } else { (0, 0) };
+                let n_read = decode_zigzag_varint(stream, &mut val)?;
+                // Signed addition because the delta might be negative; but unsigned result because IDs are always positive
+                let decoded = (last as i64) + (val as i64);
+                match state {
+                    DecodeDenseNodesFieldState::LatsStart(_) |
+                    DecodeDenseNodesFieldState::Lats(_, _, _) => {
+                        Ok(DecodeDenseNodesFieldState::Lats(idx + 1, decoded, len - n_read))
+                    },
+                    DecodeDenseNodesFieldState::LonsStart(_) |
+                    DecodeDenseNodesFieldState::Lons(_, _, _) => {
+                        Ok(DecodeDenseNodesFieldState::Lons(idx + 1, decoded, len - n_read))
+                    },
+                    _ => unreachable!()
+                }
             },
             DecodeDenseNodesFieldState::KeysValsStart(len) |
             DecodeDenseNodesFieldState::KeysVals(_, len) => {

@@ -70,6 +70,7 @@ pub fn decode_field<R: Read>(stream: &mut R, out_field_number: &mut u32, out_wir
 /// Decodes a protobuf varint from the stream into `out`.
 /// Returns Ok(None) if EOF was encountered before any byte was read.
 /// Otherwise returns Ok(Some(bytes_consumed)).
+/// varint encoding is used for int32, int64, uint32, uint64, bool, enum.
 pub fn decode_varint<R: Read>(stream: &mut R, out: &mut u64) -> Result<Option<usize>, std::io::Error> {
     let mut value = 0u64;
     let mut shift = 0;
@@ -98,6 +99,19 @@ pub fn decode_varint<R: Read>(stream: &mut R, out: &mut u64) -> Result<Option<us
     Ok(Some(consumed))
 }
 
+/// Decode a zigzag-encoded varint from the stream into `out`.
+/// zigzag-encoded varints are used for sint32 and sint64 types.
+pub fn decode_zigzag_varint<R: Read>(stream: &mut R, out: &mut i64) -> Result<usize, std::io::Error> {
+    let mut raw = 0u64;
+    let n_bytes = match decode_varint(stream, &mut raw)? {
+        Some(b) => b,
+        None => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF while reading zigzag varint")),
+    };
+    let decoded = ((raw >> 1) as i64) ^ (-((raw & 1) as i64));
+    *out = decoded;
+    Ok(n_bytes)
+} 
+
 /// Read 8 bytes (little-endian) into `out` and return number of bytes consumed (8) on success.
 pub fn decode_fixed64<R: Read>(stream: &mut R, out: &mut u64) -> Result<usize, std::io::Error> {
     let mut buf = [0u8; 8];
@@ -108,7 +122,7 @@ pub fn decode_fixed64<R: Read>(stream: &mut R, out: &mut u64) -> Result<usize, s
 
 /// Read 4 bytes (little-endian) into `out` and return number of bytes consumed (4) on success.
 pub fn decode_fixed32<R: Read>(stream: &mut R, out: &mut u32) -> Result<usize, std::io::Error> {
-    let mut buf = [0u8; 4];
+    let mut buf: [u8; 4] = [0u8; 4];
     stream.read_exact(&mut buf)?;
     *out = u32::from_le_bytes(buf);
     Ok(4)

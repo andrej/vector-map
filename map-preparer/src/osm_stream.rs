@@ -2,9 +2,9 @@ use std::f32::consts::E;
 use std::io::{Read, Seek, BufRead};
 use crate::osm_pbf;
 use prost::Message;
-use tracing::{Level, field, span, trace};
+use tracing::{Level, field, span, trace, info};
 use crate::partially_compressed::PartiallyCompressedStream;
-use crate::protobuf_helpers::{decode_field, WireType};
+use crate::protobuf_helpers::{decode_field, decode_zigzag_varint, WireType};
 use std::collections::{HashMap, VecDeque};
 use bytes::{Bytes, BytesMut};  // Bytes are a shared reference slice to a reference-counted buffer; essentially &[u8] that enforces lifetimes at runtime
 // (Note we can't use static (compile-time) lifetimes for our use case, because the underlying buffer changes over time as we read data, so we have run-time "temporal" lifetimes, whereas Rust can only enforce lifetimes for a certain code scope, and the scopes needed to update the buffer and read the references would necessarily overlap.)
@@ -22,7 +22,7 @@ pub enum RawOsmEntity {
     Relation(RawOsmRelation),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct RawOsmNode {
     pub id: u64,
     pub lat: i64,
@@ -85,22 +85,28 @@ struct PrimitiveGroupInfo {
     date_granularity: i32,
 }
 
+#[derive(Debug)]
+enum DecodeDenseNodesFieldState {
+    Start,
+    IdsStart(usize),
+    Ids(usize, u64, usize),
+    DenseInfoStart(usize),
+    DenseInfo(usize),
+    LatsStart(usize),
+    Lats(usize, i64, usize),
+    LonsStart(usize),
+    Lons(usize, i64, usize),
+    KeysValsStart(usize),
+    KeysVals(usize, usize),
+    End
+}
+
 impl<'a, R: Read + BufRead> OsmStream<R> {
     pub fn new(stream: R) -> Self {
         Self {
             stream: PartiallyCompressedStream::from_uncompressed(stream),
             state: OsmStreamState::ReadingBlobHeader,
         }
-    }
-}
-
-impl OsmStream<std::io::BufReader<std::fs::File>> {
-    pub fn from_file(path : &std::path::Path) -> std::io::Result<Self> {
-        // Note: It is critical that the BufReader is _inside_ the PotentiallyCompressedStream;
-        // this ensures that buffering works correctly even when switching between compressed and uncompressed reads.
-        // (Otherwise, the BufReader may buffer compressed data as uncompressed because it does not know at what point in the stream we will "switch on" the compression.)
-        let file = std::io::BufReader::new(std::fs::File::open(path)?);
-        Ok(Self::new(file))
     }
 }
 
@@ -136,12 +142,12 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                     ReadingBlobDataState::Start => { 
                         *reading_blob_data_state = Self::decode_blob_data_start(&mut self.stream, *size)?;
                     },
-                    ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap, groups, string_table, info } => match decoding_primitive_group_state {
+                    ReadingBlobDataState::DecodingPrimitiveGroup { state: decoding_primitive_group_state, heap: _, groups, string_table, info: _ } => match decoding_primitive_group_state {
                         DecodingPrimitiveGroupState::Start => {
                             *decoding_primitive_group_state = Self::decode_primitive_group(groups)?;
                         },
                         DecodingPrimitiveGroupState::DecodingDenseNodes(slice) => {
-                            *decoding_primitive_group_state = Self::decode_dense_nodes(slice)?;
+                            *decoding_primitive_group_state = Self::decode_dense_nodes(slice, string_table)?;
                         },
                         DecodingPrimitiveGroupState::End => {
                             *reading_blob_data_state = ReadingBlobDataState::End;
@@ -378,15 +384,16 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             groups: groups,
             string_table: string_table,
             info: PrimitiveGroupInfo {
-                granularity: 100,
-                lat_offset: 0,
-                lon_offset: 0,
-                date_granularity: 1000,
+                granularity: granularity,
+                lat_offset: lat_offset,
+                lon_offset: lon_offset,
+                date_granularity: date_granularity,
             },
         })
     }
 
     fn decode_primitive_group(groups: &mut VecDeque<Bytes>) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_primitive_group").entered();
         /*
             message PrimitiveGroup {
                 repeated Node nodes = 1;
@@ -396,11 +403,10 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                 repeated ChangeSet changesets = 5;
             }
          */
-        let _span = span!(Level::TRACE, "decode_primitive_group").entered();
 
         // Pop the next PrimitiveGroup to decode, if any;
         // note that this also updates the state (groups shrinks by one, or if empty, we move to next blob header state)
-        let Some(mut slice) = groups.pop_front() else {
+        let Some(slice) = groups.pop_front() else {
             // After processing all groups, continue with the next blob header.
             return Ok(DecodingPrimitiveGroupState::End);
         };
@@ -422,13 +428,115 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         }
     }
 
-    fn decode_dense_nodes(slice: &Bytes) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
+    fn decode_dense_nodes(slice: &Bytes, string_table: &Vec<Bytes>) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_dense_nodes").entered();
 
-        let mut entities: Vec<RawOsmEntity> = Vec::new();
+        /* 
+            message DenseNodes {
+                repeated sint64 id = 1 [packed = true]; // DELTA coded
+
+                optional DenseInfo denseinfo = 5;
+
+                repeated sint64 lat = 8 [packed = true]; // DELTA coded
+                repeated sint64 lon = 9 [packed = true]; // DELTA coded
+
+                // Special packing of keys and vals into one array. May be empty if all nodes in this block are tagless.
+                repeated int32 keys_vals = 10 [packed = true];
+            } 
+        */
+
+        let mut nodes: Vec<RawOsmNode> = Vec::new();
+
+        let slice_reader = &mut (slice as &[u8]);
+
+        let mut state = DecodeDenseNodesFieldState::Start;
+        loop {
+            state = Self::decode_dense_nodes_field(slice_reader, state)?;
+            match state {
+                DecodeDenseNodesFieldState::End => break,
+                DecodeDenseNodesFieldState::Ids(idx, id, _) => {
+                    if idx >= nodes.len() {
+                        nodes.resize(idx + 1, RawOsmNode::default());
+                    }
+                    nodes[idx] = RawOsmNode {
+                        id,
+                        lat: 0,
+                        lon: 0,
+                        kv: HashMap::new(),
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        info!("Decoded DenseNodes: {} nodes", nodes.len());
 
         // TODO: implement
         Ok(DecodingPrimitiveGroupState::Start)
+    }
+
+    fn decode_dense_nodes_field(stream: &mut &[u8], state: DecodeDenseNodesFieldState) -> Result<DecodeDenseNodesFieldState, std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_dense_nodes_field").entered();
+        trace!("Stream ptr: {:p}, state: {:?}", (*stream).as_ptr(), state);
+        match state {
+            DecodeDenseNodesFieldState::Start => {
+                let mut field_number: u32 = 0;
+                let mut wire_type = WireType::Varint(0);
+                let Some(n_read) = decode_field(stream, &mut field_number, &mut wire_type)? else {
+                    return Ok(DecodeDenseNodesFieldState::End)
+                };
+                match (field_number, &wire_type) {
+                    (1, WireType::LengthDelimited(len)) => Ok(DecodeDenseNodesFieldState::IdsStart(*len as usize)),
+                    (5, WireType::LengthDelimited(len)) => Ok(DecodeDenseNodesFieldState::DenseInfoStart(*len as usize)),
+                    (8, WireType::LengthDelimited(len)) => Ok(DecodeDenseNodesFieldState::LatsStart(*len as usize)),
+                    (9, WireType::LengthDelimited(len)) => Ok(DecodeDenseNodesFieldState::LonsStart(*len as usize)),
+                    (10, WireType::LengthDelimited(len)) => Ok(DecodeDenseNodesFieldState::KeysValsStart(*len as usize)),
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field in DenseNodes: ({}, {:?})", field_number, wire_type)))
+                }
+            },
+            DecodeDenseNodesFieldState::Ids(_, _, 0) | 
+            DecodeDenseNodesFieldState::DenseInfo(0) | 
+            DecodeDenseNodesFieldState::Lats(_, _, 0) | 
+            DecodeDenseNodesFieldState::Lons(_, _, 0) | 
+            DecodeDenseNodesFieldState::KeysVals(_, 0) => {
+                Ok(DecodeDenseNodesFieldState::Start)
+            },
+            DecodeDenseNodesFieldState::IdsStart(len) |
+            DecodeDenseNodesFieldState::Ids(_, _, len)  => {
+                let mut val: i64 = 0;
+                let (idx, last) = if let DecodeDenseNodesFieldState::Ids(idx, last, _) = state { (idx, last) } else { (0, 0) };
+                let n_read = decode_zigzag_varint(stream, &mut val)?;
+                // Signed addition because the delta might be negative; but unsigned result because IDs are always positive
+                let decoded = ((last as i64) + (val as i64)) as u64;
+                trace!("Decoded DenseNodes id: {}", decoded);
+                Ok(DecodeDenseNodesFieldState::Ids(idx + 1, decoded, len - n_read))
+            },
+            DecodeDenseNodesFieldState::DenseInfoStart(len) |
+            DecodeDenseNodesFieldState::DenseInfo(len) => {
+                // Skip dense info for now
+                *stream = &(*stream)[len..];
+                Ok(DecodeDenseNodesFieldState::Start)
+            },
+            DecodeDenseNodesFieldState::LatsStart(len) | 
+            DecodeDenseNodesFieldState::LonsStart(len) |
+            DecodeDenseNodesFieldState::Lats(_, _, len) | 
+            DecodeDenseNodesFieldState::Lons(_, _, len) => {
+                // Skip for now
+                *stream = &(*stream)[len..];
+                Ok(DecodeDenseNodesFieldState::Start)
+            },
+            DecodeDenseNodesFieldState::KeysValsStart(len) |
+            DecodeDenseNodesFieldState::KeysVals(_, len) => {
+                // Skip for now
+                // keys_vals
+                // "Each node's tags are encoded in alternating <keyid> <valid>. We use a single stringid of 0 to delimit when the tags of a node ends and the tags of the next node begin. The storage pattern is: ((<keyid> <valid>)* '0' )* As an exception, if no node in the current block has any key/value pairs, this array does not contain any delimiters, but is simply empty."
+                *stream = &(*stream)[len..];
+                Ok(DecodeDenseNodesFieldState::Start)
+            },
+            DecodeDenseNodesFieldState::End => {
+                Ok(DecodeDenseNodesFieldState::End)
+            }
+        }
     }
 
     fn decode_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {

@@ -1,10 +1,11 @@
 use std::f32::consts::E;
 use std::io::{Read, Seek, BufRead};
+use std::string;
 use crate::osm_pbf;
 use prost::Message;
 use tracing::{Level, field, span, trace, info};
 use crate::partially_compressed::PartiallyCompressedStream;
-use crate::protobuf_helpers::{decode_field, decode_zigzag_varint, WireType};
+use crate::protobuf_helpers::{decode_field, decode_varint, decode_zigzag_varint, WireType};
 use std::collections::{HashMap, VecDeque};
 use bytes::{Bytes, BytesMut, Buf};  // Bytes are a shared reference slice to a reference-counted buffer; essentially &[u8] that enforces lifetimes at runtime
 // (Note we can't use static (compile-time) lifetimes for our use case, because the underlying buffer changes over time as we read data, so we have run-time "temporal" lifetimes, whereas Rust can only enforce lifetimes for a certain code scope, and the scopes needed to update the buffer and read the references would necessarily overlap.)
@@ -27,7 +28,7 @@ pub struct RawOsmNode {
     pub id: u64,
     pub lat: i64,
     pub lon: i64,
-    pub kv: HashMap<Bytes, Bytes>
+    pub kv: Vec<(Bytes, Bytes)>
 }
 
 #[derive(Debug)]
@@ -104,22 +105,6 @@ enum DecodingDenseNodesState {
     End
 }
 
-#[derive(Debug)]
-enum DecodeDenseNodesFieldState {
-    Start,
-    IdsStart(usize),
-    Ids(usize, u64, usize),
-    DenseInfoStart(usize),
-    DenseInfo(usize),
-    LatsStart(usize),
-    Lats(usize, i64, usize),
-    LonsStart(usize),
-    Lons(usize, i64, usize),
-    KeysValsStart(usize),
-    KeysVals(usize, usize),
-    End
-}
-
 impl<'a, R: Read + BufRead> OsmStream<R> {
     pub fn new(stream: R) -> Self {
         Self {
@@ -169,7 +154,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                             DecodingDenseNodesState::Start => 
                                 *decoding_dense_nodes_state = Self::decode_dense_nodes_start(slice)?,
                             DecodingDenseNodesState::Decoding { .. } => {
-                                Self::decode_dense_nodes_single(decoding_dense_nodes_state)?;
+                                Self::decode_dense_nodes_single(decoding_dense_nodes_state, string_table)?;
                             },
                             DecodingDenseNodesState::End => {
                                 *decoding_primitive_group_state = DecodingPrimitiveGroupState::Start;
@@ -194,6 +179,36 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             }
         };
         Ok(())
+    }
+
+    fn skip_next(&mut self) -> Result<(), std::io::Error> {
+        match &mut self.state {
+            OsmStreamState::ReadingBlobHeader => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cannot skip in ReadingBlobHeader state"))
+            }
+            OsmStreamState::ReadingBlobStart(header) => {
+                self.stream.seek(std::io::SeekFrom::Current(header.datasize as i64))?;
+                self.state = OsmStreamState::ReadingBlobHeader;
+                Ok(())
+            },
+            // The challenge inside the ReadingBlob state is that self.stream is a compressed stream; and we have not kept track of how much of it has laready been read.
+            // To skip to the end of it would require reading `size` uncompressed bytes, but it is unclear to how many compressed bytes that equates.
+            // OsmStreamState::ReadingBlob { state, size, skip_at_end, .. } => match state {
+            //     ReadingBlobState::ReadingHeaderBlock => {
+            //         self.stream.seek(std::io::SeekFrom::Current(*size as i64 + *skip_at_end as i64))?;
+            //         self.state = OsmStreamState::ReadingBlobHeader;
+            //         Ok(())
+            //     },
+            //     ReadingBlobState::ReadingBlobData(_) => {
+            //         self.stream.seek(std::io::SeekFrom::Current(*size as i64 + *skip_at_end as i64))?;
+            //         self.state = OsmStreamState::ReadingBlobHeader;
+            //         Ok(())
+            //     },
+            // },
+            _ => { 
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Cannot skip in current state"))
+            },
+        }
     }
 
     fn decode_blob_header(stream: &mut PartiallyCompressedStream<R>) -> Result<OsmStreamState, std::io::Error> {
@@ -389,12 +404,28 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         let mut string_table: Vec<Bytes> = Vec::new();
         if let Some(range) = string_table_loc {
             let string_table_heap = heap.slice(range.start..range.end);
-            for slice in string_table_heap.split(|&b| b == 0) {
-                //let s = std::str::from_utf8(slice)
-                //    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8 in string table: {e}")))?;
-                let substr_start_idx = range.start + (slice.as_ptr() as usize - string_table_heap.as_ptr() as usize);
-                let substr_end_idx = substr_start_idx + slice.len();
-                string_table.push(string_table_heap.slice(substr_start_idx..substr_end_idx));
+            let mut slice_reader = &string_table_heap[..];
+            let mut field_number: u32 = 0;
+            let mut wire_type = WireType::Varint(0);
+            let mut pos = 0;
+            while let Some(n_read) = decode_field(&mut slice_reader, &mut field_number, &mut wire_type)? {
+                trace!("StringTable field: number={}, wire_type={:?}, n_read={:?}", field_number, wire_type, n_read);
+                if field_number != 1 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field number in StringTable: {}", field_number)));
+                }
+                match wire_type {
+                    WireType::LengthDelimited(len) => {
+                        let start = range.start + pos + n_read;
+                        let end = start + len as usize;
+                        string_table.push(heap.slice(start..end));
+                        pos += n_read + len as usize;
+                        // Advance slice_reader past the data we just consumed
+                        slice_reader = &slice_reader[len as usize..];
+                    },
+                    _ => {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected length-delimited wire type for StringTable entry"));
+                    }
+                }
             }
         }
 
@@ -523,7 +554,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         })
     }
 
-    fn decode_dense_nodes_single(state: &mut DecodingDenseNodesState) -> Result<(), std::io::Error> {
+    fn decode_dense_nodes_single(state: &mut DecodingDenseNodesState, string_table: &Vec<Bytes>) -> Result<(), std::io::Error> {
         let _span = span!(Level::TRACE, "decode_dense_nodes_single").entered();
 
         let DecodingDenseNodesState::Decoding { 
@@ -554,6 +585,33 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         node.lat = Self::decode_delta_coded_field(lats_slice, last_lat)?;
         node.lon = Self::decode_delta_coded_field(lons_slice, last_lon)?;
 
+        // Key/value decoding
+        enum KvState { Key, Value };
+        let mut kv_state = KvState::Key;
+        loop {
+            let mut key_or_val_idx: u64 = 0;
+            let Some(n_read) = decode_varint(&mut &keys_vals_slice[..], &mut key_or_val_idx)? else {
+                break;
+            };
+            keys_vals_slice.advance(n_read);
+            if key_or_val_idx == 0 {
+                break;
+            }
+            let Some(key_or_val) = string_table.get(key_or_val_idx as usize) else {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Key/Value index out of bounds: {}", key_or_val_idx)));
+            };
+            kv_state = match kv_state {
+                KvState::Key => {
+                    node.kv.push((key_or_val.clone(), Bytes::new()));
+                    KvState::Value
+                },
+                KvState::Value => {
+                    node.kv.last_mut().unwrap().1 = key_or_val.clone();
+                    KvState::Key
+                }
+            }
+        }
+
         trace!("Decoded DenseNode: {:?}", node);
 
         Ok(())
@@ -581,3 +639,4 @@ impl<R: Read + BufRead + Seek> Iterator for OsmStream<R> {
         self.decode_until_entity().unwrap()
     }
 }
+

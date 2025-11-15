@@ -11,6 +11,7 @@ use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::io::{Read, Seek};
 
 const CHUNK_SIZE: usize = 8192;
 
@@ -52,6 +53,7 @@ struct ClArgs {
 #[derive(Default, Clone)]
 struct ThreadStatus {
     bytes_read: u64,
+    start_pos: u64,
     file_pos: u64,
 }
 
@@ -145,7 +147,20 @@ fn main() -> std::io::Result<()> {
                 .num_threads(num_threads)
                 .build_global()
                 .unwrap();
-            info!("Using {} threads for parallel processing of {} blobs", num_threads, blob_infos.len());
+            
+            // Partition blobs into contiguous chunks, one per thread
+            let blobs_per_thread = (blob_infos.len() + num_threads - 1) / num_threads;
+            let mut blob_chunks: Vec<Vec<_>> = Vec::with_capacity(num_threads);
+            for i in 0..num_threads {
+                let start = i * blobs_per_thread;
+                let end = ((i + 1) * blobs_per_thread).min(blob_infos.len());
+                if start < blob_infos.len() {
+                    blob_chunks.push(blob_infos[start..end].to_vec());
+                }
+            }
+            
+            info!("Using {} threads for parallel processing of {} blobs ({} blobs/thread)", 
+                  num_threads, blob_infos.len(), blobs_per_thread);
             
             // Thread positions for progress bar
             let thread_status = Arc::new(Mutex::new(vec![ThreadStatus::default(); num_threads]));
@@ -164,31 +179,52 @@ fn main() -> std::io::Result<()> {
                 }
             });
             
-            // Process blobs in parallel
-            let total: usize = blob_infos.par_iter().enumerate().map(|(idx, blob_info)| {
+            // Process blob chunks in parallel - each thread gets a contiguous slice
+            let total: usize = blob_chunks.par_iter().enumerate().map(|(thread_idx, chunk)| {
+                if chunk.is_empty() {
+                    return 0;
+                }
+                
+                let thread_status = thread_status.clone();
                 let file = std::fs::File::open(&filename).unwrap();
-                let thread_idx = idx % num_threads;
-                let thread_status= thread_status.clone();
+                
+                // Calculate the contiguous range for this chunk
+                let start_pos = chunk[0].position;
+                let end_blob = &chunk[chunk.len() - 1];
+                let total_size = (end_blob.position + end_blob.size) - start_pos;
+                
+                // Set the starting position for this thread
+                {
+                    let mut status = thread_status.lock().unwrap();
+                    status[thread_idx].start_pos = start_pos;
+                    status[thread_idx].file_pos = start_pos;
+                }
                 
                 // Wrap file in InstrumentedReader to track position
                 let instrumented = instrumented_reader::InstrumentedReader::with_frequency(
                     file,
                     1024 * 1024, // Update every 1MB
                     move |bytes_read, file_pos| {
-                        let mut thread_status = thread_status.lock().unwrap();
-                        thread_status[thread_idx].file_pos = file_pos;
-                        thread_status[thread_idx].bytes_read = bytes_read;
+                        let mut status = thread_status.lock().unwrap();
+                        status[thread_idx].file_pos = file_pos;
+                        status[thread_idx].bytes_read = bytes_read;
                     }
                 );
                 
-                let reader = std::io::BufReader::with_capacity(args.chunk_size, instrumented);
-                let mut blob_stream = blob_info.create_reader(reader).unwrap();
+                // Seek to start of this chunk and create a Take reader for the entire range
+                let mut seekable = instrumented;
+                seekable.seek(std::io::SeekFrom::Start(start_pos)).unwrap();
+                let limited = seekable.take(total_size);
                 
-                let mut count = 0;
-                for _entity in blob_stream.nodes() {
-                    count += 1;
+                let reader = std::io::BufReader::with_capacity(args.chunk_size, limited);
+                let mut stream = OsmStream::new(reader);
+                
+                // Count all nodes in this contiguous chunk
+                let mut chunk_count = 0;
+                for _node in stream.nodes() {
+                    chunk_count += 1;
                 }
-                count
+                chunk_count
             }).sum();
 
             running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -248,12 +284,25 @@ fn print_progress_parallel(thread_status: &[ThreadStatus], file_size: u64, start
     let bar_width = 80 - 20;
     let mut bar = vec![' '; bar_width];
     
-    // Place thread numbers on progress bar
+    // Draw trails for each thread showing processed portion
     for (i, ts) in thread_status.iter().enumerate() {
-        let percentage = (ts.file_pos as f64 / file_size as f64) * 100.0;
-        let bar_pos = ((percentage / 100.0) * bar_width as f64) as usize;
-        if bar_pos < bar_width {
-            bar[bar_pos] = char::from_digit((i + 1) as u32, 10).unwrap_or('*');
+        // Calculate this thread's actual starting position in the bar
+        let start_pct = (ts.start_pos as f64 / file_size as f64);
+        let start_bar_pos = (start_pct * bar_width as f64) as usize;
+        
+        // Calculate current position of this thread
+        let current_pct = (ts.file_pos as f64 / file_size as f64);
+        let current_bar_pos = (current_pct * bar_width as f64) as usize;
+        
+        // Draw trail from actual start position to current position
+        let thread_char = char::from_digit((i + 1) as u32, 10).unwrap_or('*');
+        for pos in start_bar_pos..current_bar_pos.min(bar_width) {
+            bar[pos] = thread_char;
+        }
+        
+        // Place thread number at current position
+        if current_bar_pos < bar_width {
+            bar[current_bar_pos] = thread_char;
         }
     }
     

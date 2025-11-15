@@ -25,6 +25,10 @@ impl<R: Read + BufRead> PartiallyCompressedStream<R> {
     pub fn disable_compression(&mut self) {
         self.stream = std::mem::take(&mut self.stream).into_uncompressed();
     }
+
+    pub fn is_compressed(&self) -> bool {
+        matches!(self.stream, PartiallyCompressedStreamReader::ZlibCompressed(_))
+    }
 }
 
 impl<R: Read + BufRead> Default for PartiallyCompressedStreamReader<R> {

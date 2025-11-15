@@ -69,9 +69,6 @@ impl<R: Read + BufRead + Seek> Seek for PartiallyCompressedStream<R> {
     /// When in a compressed part, it is only allowed to seek by an amount of compressed bytes that leads outside of the compressed region;
     /// however, this requirement is not checked or enforced. You can end up in a broken state (reading compressed bytes as uncompressed) if you violate it.
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        if let PartiallyCompressedStreamReader::ZlibCompressed(decoder) = &self.stream {
-            self.disable_compression();
-        }
         match &mut self.stream {
             PartiallyCompressedStreamReader::Uncompressed(reader) => reader.seek(pos),
             _ => panic!("Can only seek in uncompressed stream"),
@@ -100,8 +97,17 @@ impl<R: Read + BufRead> PartiallyCompressedStreamReader<R> {
     }
 
     pub fn into_uncompressed(self) -> PartiallyCompressedStreamReader<R> {
-        if let PartiallyCompressedStreamReader::ZlibCompressed(decoder) = self {
+        if let PartiallyCompressedStreamReader::ZlibCompressed(mut decoder) = self {
+            // It appears that the ZlibDecoder may still consume some bytes from the underlying stream even when returning zero bytes.
+            // Perhaps there is some footer or checksum at the end of the compressed stream that needs to be read.
+            // We need to advance the underlying stream to the end of the compressed part before returning it.
+            let Ok(0) = decoder.read(&mut []) else {
+                panic!("into_uncompressed called on a ZlibCompressed stream that has not been fully read yet");
+            };
             let inner_limited: std::io::Take<R> = decoder.into_inner();
+            if inner_limited.limit() > 0 {
+                panic!("ZlibDecoder did not consume all underlying compressed bytes");
+            }
             return PartiallyCompressedStreamReader::Uncompressed(inner_limited.into_inner())
         }
         panic!("into_uncompressed called on a stream that is not ZlibCompressed");

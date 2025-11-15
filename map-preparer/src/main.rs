@@ -25,6 +25,18 @@ struct ClArgs {
     #[arg(short = 'c', long = "chunk-size", default_value_t = 8192)]
     chunk_size: usize,
 
+    /// Skip the first N blobs.
+    #[arg(long, default_value_t = 0)]
+    skip_blobs: usize,
+
+    /// List blobs in the file without decoding them
+    #[arg(long)]
+    count_blobs: bool,
+
+    /// List entities in the file
+    #[arg(long)]
+    count_entities: bool,
+
     /// Verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbosity: u8,
@@ -48,9 +60,9 @@ fn main() -> std::io::Result<()> {
     let metadata = std::fs::metadata(filename).unwrap();
     let file_size = metadata.len();
     let start_time = std::time::Instant::now();
-    let mut counting_reader = instrumented_reader::InstrumentedReader::with_callback(file, |bytes_read| {
-        let percentage = (bytes_read as f64 / file_size as f64) * 100.0;
-        print_progress(percentage, bytes_read, start_time);
+    let mut counting_reader = instrumented_reader::InstrumentedReader::with_callback(file, |bytes_read, file_pos| {
+        let percentage = (file_pos as f64 / file_size as f64) * 100.0;
+        print_progress(percentage, bytes_read, file_pos, start_time);
     });
     let stream = std::io::BufReader::with_capacity(args.chunk_size, &mut counting_reader);
 
@@ -58,11 +70,51 @@ fn main() -> std::io::Result<()> {
         baseline(stream);
         return Ok(());
     }
+    
     let mut osmstream = OsmStream::new(stream);
 
-    for entity in osmstream {
-        println!("{:?}", entity);
+    if args.skip_blobs > 0 {
+        let mut blob_iterator = osmstream.blobs();
+        for i in 0..args.skip_blobs {
+            match blob_iterator.next() {
+                Some(Ok(_)) => {},
+                Some(Err(e)) => return Err(e),
+                None => break,
+            }
+        }
+
     }
+
+    if args.count_blobs {
+        let mut blob_count = 0;
+        let mut header_count = 0;
+        let mut data_count = 0;
+        
+        for blob_result in osmstream.blobs() {
+            let blob = blob_result?;
+            blob_count += 1;
+            match blob.blob_type.as_str() {
+                "OSMHeader" => header_count += 1,
+                "OSMData" => data_count += 1,
+                _ => {}
+            }
+        }
+        
+        println!("\nSummary:");
+        println!("  Total blobs: {}", blob_count);
+        println!("  Header blobs: {}", header_count);
+        println!("  Data blobs: {}", data_count);
+        return Ok(());
+    }
+
+    if args.count_entities {
+        let mut entity_count = 0;
+        for entity in osmstream {
+            entity_count += 1;
+        }
+        println!("\nTotal entities: {}", entity_count);
+    }
+
     Ok(())
 }
 
@@ -76,8 +128,27 @@ fn baseline<R: std::io::Read>(mut reader: R) {
     }
 }
 
-fn print_progress(percentage: f64, bytes_read: u64, start_time: std::time::Instant) {
+fn print_progress(percentage: f64, bytes_read: u64, file_pos: u64, start_time: std::time::Instant) {
     let now = std::time::Instant::now();
     let throughput = bytes_read as f64 / now.duration_since(start_time).as_secs_f64();
-    eprint!("\rProgress: {:>6.2}% ({:.2} MiB read, {:.2} MiB/s)", percentage, bytes_read as f64 / (1024.0 * 1024.0), throughput / (1024.0 * 1024.0));
+    let throughput_mib = throughput / (1024.0 * 1024.0);
+    
+    // Calculate progress bar width: 80 chars total - brackets - percentage - throughput - spaces
+    // Format: "[...] XX.X% XXX.X MiB/s"
+    // Reserve: 2 (brackets) + 1 (space) + 6 (percentage) + 1 (space) + 10 (throughput) = 20 chars
+    let bar_width = 80 - 20;
+    let progress_pos = ((percentage / 100.0) * bar_width as f64) as usize;
+    let progress_pos = progress_pos.min(bar_width);
+    
+    // Build progress bar with 'o' at position and spaces elsewhere
+    let mut bar = String::with_capacity(bar_width);
+    for i in 0..bar_width {
+        if i == progress_pos && progress_pos > 0 {
+            bar.push('o');
+        } else {
+            bar.push(' ');
+        }
+    }
+    
+    eprint!("\r[{}] {:>5.2}% {:>6.1} MiB/s", bar, percentage, throughput_mib);
 }

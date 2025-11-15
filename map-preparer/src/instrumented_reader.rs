@@ -12,23 +12,26 @@ pub const DEFAULT_FREQUENCY: u64 = 8 * 1024 * 1024;
 /// The callback is invoked when the cumulative number of bytes read crosses
 /// multiples of `frequency`. If a single read crosses several multiples, the
 /// callback is invoked once per crossed multiple, in order.
+///
+/// The callback receives two arguments: total bytes read and current file position.
 #[derive(Debug)]
 pub struct InstrumentedReader<R, F>
 where
     R: Read,
-    F: FnMut(u64),
+    F: FnMut(u64, u64),
 {
     inner: R,
     callback: F,
     frequency: u64,
     total_read: u64,
+    position: u64,
     next_threshold: u64,
 }
 
 impl<R, F> InstrumentedReader<R, F>
 where
     R: Read,
-    F: FnMut(u64),
+    F: FnMut(u64, u64),
 {
     /// Create a new `InstrumentedReader` with the default frequency (8 MiB).
     pub fn new(inner: R, callback: F) -> Self {
@@ -50,6 +53,7 @@ where
             callback,
             frequency: freq,
             total_read: 0,
+            position: 0,
             next_threshold: freq,
         }
     }
@@ -81,7 +85,7 @@ where
 
     fn maybe_fire_callbacks(&mut self) {
         while self.total_read >= self.next_threshold {
-            (self.callback)(self.total_read);
+            (self.callback)(self.total_read, self.position);
             // Avoid overflow in extremely long streams (practically unreachable)
             let next = self.next_threshold.saturating_add(self.frequency);
             if next <= self.next_threshold { // overflow or frequency == 0 (guarded above)
@@ -95,12 +99,13 @@ where
 impl<R, F> Read for InstrumentedReader<R, F>
 where
     R: Read,
-    F: FnMut(u64),
+    F: FnMut(u64, u64),
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.total_read = self.total_read.saturating_add(n as u64);
+            self.position = self.position.saturating_add(n as u64);
             self.maybe_fire_callbacks();
         }
         Ok(n)
@@ -110,6 +115,7 @@ where
         let n = self.inner.read_vectored(bufs)?;
         if n > 0 {
             self.total_read = self.total_read.saturating_add(n as u64);
+            self.position = self.position.saturating_add(n as u64);
             self.maybe_fire_callbacks();
         }
         Ok(n)
@@ -120,11 +126,12 @@ where
 impl<R, F> Seek for InstrumentedReader<R, F>
 where
     R: Read + Seek,
-    F: FnMut(u64),
+    F: FnMut(u64, u64),
 {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        // Seeking does not alter instrumentation counters; only actual reads advance total_read.
-        self.inner.seek(pos)
+        let new_pos = self.inner.seek(pos)?;
+        self.position = new_pos;
+        Ok(new_pos)
     }
 }
 
@@ -138,8 +145,8 @@ mod tests {
         let data = vec![0u8; 20 * 1024 * 1024]; // 20 MiB
         let cursor = Cursor::new(data);
 
-        let mut hits: Vec<u64> = Vec::new();
-        let cb = |n: u64| hits.push(n);
+        let mut hits: Vec<(u64, u64)> = Vec::new();
+        let cb = |bytes_read: u64, pos: u64| hits.push((bytes_read, pos));
 
         let mut reader = InstrumentedReader::with_frequency(cursor, 8 * 1024 * 1024, cb);
 
@@ -153,8 +160,8 @@ mod tests {
         // 20 MiB crosses 8 MiB and 16 MiB -> two callbacks
         assert_eq!(hits.len(), 2);
         // The total_read values at callback time are >= thresholds
-        assert!(hits[0] >= 8 * 1024 * 1024);
-        assert!(hits[1] >= 16 * 1024 * 1024);
+        assert!(hits[0].0 >= 8 * 1024 * 1024);
+        assert!(hits[1].0 >= 16 * 1024 * 1024);
     }
 
     #[test]
@@ -162,7 +169,7 @@ mod tests {
         let data = vec![0u8; (DEFAULT_FREQUENCY as usize) + 1];
         let cursor = Cursor::new(data);
         let mut called = false;
-        let mut reader = InstrumentedReader::with_frequency(cursor, 0, |_| { called = true; });
+        let mut reader = InstrumentedReader::with_frequency(cursor, 0, |_, _| { called = true; });
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = reader.read(&mut buf).unwrap();
@@ -176,8 +183,7 @@ mod tests {
         let data = vec![0u8; (DEFAULT_FREQUENCY as usize) + 10];
         let cursor = Cursor::new(data);
         let mut count = 0u32;
-        let mut reader = InstrumentedReader::new(cursor, |_| { count += 1; });
-        let mut buf = vec![0u8; 128 * 1024];
+        let mut reader = InstrumentedReader::new(cursor, |_, _| { count += 1; });
         io::copy(&mut reader, &mut io::sink()).unwrap();
         assert!(count >= 1);
     }

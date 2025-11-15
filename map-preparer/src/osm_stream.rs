@@ -1,12 +1,10 @@
-use std::f32::consts::E;
 use std::io::{Read, Seek, BufRead};
-use std::string;
 use crate::osm_pbf;
 use prost::Message;
-use tracing::{Level, field, span, trace, info};
+use tracing::{Level, span, trace};
 use crate::partially_compressed::PartiallyCompressedStream;
 use crate::protobuf_helpers::{decode_field, decode_varint, decode_zigzag_varint, WireType};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use bytes::{Bytes, BytesMut, Buf};  // Bytes are a shared reference slice to a reference-counted buffer; essentially &[u8] that enforces lifetimes at runtime
 // (Note we can't use static (compile-time) lifetimes for our use case, because the underlying buffer changes over time as we read data, so we have run-time "temporal" lifetimes, whereas Rust can only enforce lifetimes for a certain code scope, and the scopes needed to update the buffer and read the references would necessarily overlap.)
 
@@ -56,28 +54,54 @@ impl<'a, R: Read + BufRead> OsmStream<R> {
 }
 
 impl<R: Read + BufRead + Seek> OsmStream<R> {
-    /// Create an iterator that iterates through blobs without decoding their contents
+    /// Create an iterator that yields BlobInfo for each blob in the file.
+    /// Each BlobInfo contains position and size information that can be used to create
+    /// independent "reduced" OsmStream readers via `BlobInfo::create_reader()`.
+    /// This is useful for parallel processing of blobs.
     pub fn blobs<'a>(&'a mut self) -> BlobIterator<'a, R> {
         BlobIterator::new(self)
     }
-}
 
-impl<R: Read + BufRead + Seek> Iterator for OsmStream<R> {
-    type Item = RawOsmEntity;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.decode_until_entity().unwrap()
+    pub fn nodes<'a>(&'a mut self) -> NodeIterator<'a, R> {
+        NodeIterator::new(self)
     }
 }
 
-/// Iterator that yields blob metadata without decoding the blob contents
-pub struct BlobIterator<'a, R: Read + BufRead + Seek> {
-    stream: &'a mut OsmStream<R>,
-}
-
+/// Information about a blob in the PBF file, including its position and size.
+/// This can be used to create independent OsmStream readers for parallel processing.
 #[derive(Debug, Clone)]
 pub struct BlobInfo {
     pub blob_type: String,
-    pub datasize: i32,
+    /// File position where this blob starts (at the BlobHeader size field)
+    pub position: u64,
+    /// Total size of this blob including the 4-byte header size, BlobHeader, and Blob data
+    pub size: u64,
+}
+
+impl BlobInfo {
+    /// Create an OsmStream reader that is limited to reading just this blob.
+    /// The reader R must support seeking to the blob's position.
+    /// This creates a "reduced" OsmStream that will only process entities within this single blob.
+    ///
+    /// This is particularly useful for parallel processing, where each thread can open its own
+    /// file handle and create a reduced OsmStream for a specific blob.
+    pub fn create_reader<R: Read + BufRead + Seek>(&self, mut reader: R) -> std::io::Result<OsmStream<std::io::Take<R>>> {
+        // Seek to the start of this blob
+        reader.seek(std::io::SeekFrom::Start(self.position))?;
+        // Use std::io::Take to limit reading to just this blob
+        let limited = reader.take(self.size);
+        Ok(OsmStream::new(limited))
+    }
+}
+
+/// Iterator that yields BlobInfo for each blob in the OSM PBF file.
+/// 
+/// Each BlobInfo contains position and size information that can be used to create
+/// independent "reduced" OsmStream readers via `BlobInfo::create_reader()`.
+/// This enables parallel processing of blobs, where each blob can be processed
+/// independently by different threads.
+pub struct BlobIterator<'a, R: Read + BufRead + Seek> {
+    stream: &'a mut OsmStream<R>,
 }
 
 impl<'a, R: Read + BufRead + Seek> BlobIterator<'a, R> {
@@ -90,11 +114,21 @@ impl<'a, R: Read + BufRead + Seek> Iterator for BlobIterator<'a, R> {
     type Item = Result<BlobInfo, std::io::Error>;
     
     fn next(&mut self) -> Option<Self::Item> {
+        // Get the current position before reading the blob header
+        let start_pos = match self.stream.stream.stream_position() {
+            Ok(pos) => pos,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Read through to get to the ReadingBlobStart state
         loop {
             match &self.stream.state {
                 OsmStreamState::End => return None,
                 OsmStreamState::Uninitialized => {
-                    return Some(Err(std::io::Error::new( std::io::ErrorKind::InvalidData, "Stream is uninitialized")));
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Stream is uninitialized"
+                    )));
                 }
                 OsmStreamState::ReadingBlobHeader => {
                     if let Err(e) = self.stream.decode_next() {
@@ -102,10 +136,23 @@ impl<'a, R: Read + BufRead + Seek> Iterator for BlobIterator<'a, R> {
                     }
                 }
                 OsmStreamState::ReadingBlobStart(header) => {
+                    // Calculate the total size of this blob
+                    // 4 bytes (header size) + header size + datasize
+                    let current_pos = match self.stream.stream.stream_position() {
+                        Ok(pos) => pos,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let header_size = (current_pos - start_pos - 4) as i32;
+                    let total_size = 4 + header_size as u64 + header.datasize as u64;
+                    
+                    // Clone the relevant info before we modify the state
                     let blob_info = BlobInfo {
                         blob_type: header.r#type.clone(),
-                        datasize: header.datasize,
+                        position: start_pos,
+                        size: total_size,
                     };
+                    
+                    // Skip this blob in the main stream
                     if let Err(e) = self.stream.skip_next() {
                         return Some(Err(e));
                     }
@@ -122,6 +169,45 @@ impl<'a, R: Read + BufRead + Seek> Iterator for BlobIterator<'a, R> {
     }
 }
 
+pub struct NodeIterator<'a, R: Read + BufRead + Seek> {
+    stream: &'a mut OsmStream<R>,
+}
+
+impl<'a, R: Read + BufRead + Seek> NodeIterator<'a, R> {
+    pub fn new(stream: &'a mut OsmStream<R>) -> Self {
+        Self { stream }
+    }
+}
+
+impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
+    type Item = RawOsmNode;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.stream.decode_next().unwrap();
+            match &self.stream.state {
+                OsmStreamState::ReadingBlob {
+                    state: ReadingBlobState::ReadingBlobData(
+                        ReadingBlobDataState::DecodingPrimitiveGroup {
+                            state: DecodingPrimitiveGroupState::DecodingDenseNodes { state: DecodingDenseNodesState::Decoding { node, .. }, .. },
+                            ..
+                        },
+                    ),
+                    ..
+                } => {
+                    return Some(node.clone());
+                },
+                OsmStreamState::End => {
+                    return None;
+                },
+                _ => {
+                    // Continue until state is one of the above two.
+                    continue;
+                }
+            }
+        }
+    }
+}
 
 // --------------------------------------------------------------------------
 // Private Implementation
@@ -245,30 +331,12 @@ enum DecodingDenseNodesState {
         lats_slice: Bytes,
         lons_slice: Bytes,
         keys_vals_slice: Bytes,
-        last_id: u64,
-        last_lat: i64,
-        last_lon: i64,
-        node: Option<RawOsmNode>,
+        node: RawOsmNode,
     },
     End
 }
 
 impl<R: Read + BufRead + Seek> OsmStream<R> {
-    fn decode_until_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {
-        // If we're not currently reading entities, get into the "reading entities" state
-        while match self.state {
-            OsmStreamState::End => false,
-            _ => true,
-        } {
-            self.decode_next()?;
-        }
-        // Read the next entity, if any
-        match self.state {
-            OsmStreamState::End => self.decode_entity(),
-            _ => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Not in ReadingEntities state")),
-        }
-    }
-
     fn decode_next(&mut self) -> Result<(), std::io::Error> {
         match &mut self.state {
             OsmStreamState::Uninitialized => {
@@ -726,6 +794,22 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             (2, WireType::LengthDelimited(_)) => { // Dense nodes
                 Ok(DecodingPrimitiveGroupState::DecodingDenseNodes { slice: subslice, state: DecodingDenseNodesState::Start })
             },
+            (3, WireType::LengthDelimited(_)) => { // Ways
+                // Not yet implemented, skip
+                Ok(DecodingPrimitiveGroupState::Start)
+            },
+            (4, WireType::LengthDelimited(_)) => { // Relations
+                // Not yet implemented, skip
+                Ok(DecodingPrimitiveGroupState::Start)
+            },
+            (1, WireType::LengthDelimited(_)) => { // Nodes
+                // Not yet implemented, skip
+                Ok(DecodingPrimitiveGroupState::Start)
+            },
+            (5, WireType::LengthDelimited(_)) => { // Changesets
+                // Not yet implemented, skip
+                Ok(DecodingPrimitiveGroupState::Start)
+            },
             _ => {
                 Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Unexpected field in PrimitiveGroup: ({}, {:?})", field_number, wire_type)))
             }
@@ -794,10 +878,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             lats_slice,
             lons_slice,
             keys_vals_slice,
-            last_id: 0,
-            last_lat: 0,
-            last_lon: 0,
-            node: None,
+            node: RawOsmNode::default(),
         })
     }
 
@@ -809,10 +890,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             lats_slice, 
             lons_slice, 
             keys_vals_slice, 
-            last_id,
-            last_lat,
-            last_lon,
-            node:  node_ref
+            node
         } = state else {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid state for decoding dense nodes single"));
         };
@@ -822,15 +900,11 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             return Ok(());
         }
 
-        if node_ref.is_none() {
-            *node_ref = Some(RawOsmNode::default());
-        }
-        let node = node_ref.as_mut().unwrap();
-
         // The following not only decodes the fields, but also advances the state slices and updates the last_* values
-        node.id = Self::decode_delta_coded_field(ids_slice, last_id)?;
-        node.lat = Self::decode_delta_coded_field(lats_slice, last_lat)?;
-        node.lon = Self::decode_delta_coded_field(lons_slice, last_lon)?;
+        node.kv.clear();
+        node.id = Self::decode_delta_coded_field(ids_slice, node.id)?;
+        node.lat = Self::decode_delta_coded_field(lats_slice, node.lat)?;
+        node.lon = Self::decode_delta_coded_field(lons_slice, node.lon)?;
 
         // Key/value decoding
         enum KvState { Key, Value };
@@ -864,19 +938,51 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         Ok(())
     }
 
-    fn decode_delta_coded_field<T>(slice: &mut Bytes, last_value: &mut T) -> Result<T, std::io::Error>
+    fn decode_delta_coded_field<T>(slice: &mut Bytes, last_value: T) -> Result<T, std::io::Error>
     where T: std::ops::Add<Output = T> + TryFrom<i64> + Copy
     {
         let mut delta: i64 = 0;
         let n_read = decode_zigzag_varint(&mut &slice[..], &mut delta)?;
         slice.advance(n_read);
-        let decoded_value = *last_value + T::try_from(delta).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to convert delta"))?;
-        *last_value = decoded_value;
+        let decoded_value = last_value + T::try_from(delta).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to convert delta"))?;
         Ok(decoded_value)
     }
 
     fn decode_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Not implemented yet"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_blob_info_with_reduced_readers() {
+        // This test demonstrates the concept of creating reduced OsmStream readers
+        // In a real scenario, you would use actual OSM PBF data
+        
+        // Example: collecting blob infos (first pass)
+        // let file = std::fs::File::open("test.osm.pbf").unwrap();
+        // let reader = std::io::BufReader::new(file);
+        // let mut stream = OsmStream::new(reader);
+        // 
+        // let blob_infos: Vec<BlobInfo> = stream.blobs()
+        //     .collect::<Result<Vec<_>, _>>()
+        //     .unwrap();
+        //
+        // Example: processing blobs independently (second pass)
+        // for blob_info in &blob_infos {
+        //     let file = std::fs::File::open("test.osm.pbf").unwrap();
+        //     let reader = std::io::BufReader::new(file);
+        //     let mut reduced_stream = blob_info.create_reader(reader).unwrap();
+        //     
+        //     // This reduced_stream will only process entities from this one blob
+        //     for entity in reduced_stream {
+        //         // Process entity
+        //     }
+        // }
     }
 }
 

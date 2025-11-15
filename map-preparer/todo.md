@@ -2,8 +2,6 @@
 
 Working implementation that decodes up to the IDs of dense nodes.
 
-Issue at about ~14% of the file, decoding fails with an invalid field (field number 0).
-
 # Next steps
 
  - Decode remainder of fields in decode_dense_node_field
@@ -14,3 +12,5 @@ Issue at about ~14% of the file, decoding fails with an invalid field (field num
 # Tests
 
 - [ ] Add test for Blob start decoding when the "raw_size" field is not at the start
+- `target/release/map-preparer --count-entities ./planet-250526.osm.pbf --skip-blobs 5631` -- at this point, the planet file has some zlib compressed data with a footer that requires special handling
+

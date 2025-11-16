@@ -6,7 +6,7 @@ mod protobuf_helpers;
 mod instrumented_reader;
 
 use clap::Parser;
-use osm_stream::OsmStream;
+use osm_stream::{OsmStream, RawOsmNode, BlobInfo};
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 use rayon::prelude::*;
@@ -25,8 +25,12 @@ struct ClArgs {
     #[arg(short, long)]
     baseline: bool,
 
+    /// Buffer chunk size for the blob scan
+    #[arg(long = "blob-scan-chunk-size", default_value_t = 128)]
+    blob_scan_chunk_size: usize,
+
     /// Buffer chunk size in bytes
-    #[arg(short = 'c', long = "chunk-size", default_value_t = 8192)]
+    #[arg(short = 'c', long = "chunk-size", default_value_t = 16384)]
     chunk_size: usize,
 
     /// Skip the first N blobs.
@@ -42,7 +46,7 @@ struct ClArgs {
     count_nodes: bool,
 
     /// Number of parallel threads for entity processing (0 = sequential)
-    #[arg(short = 'j', long = "threads", default_value_t = 1)]
+    #[arg(short = 'j', long = "threads", default_value_t = 8)]
     threads: usize,
 
     /// Verbosity
@@ -71,167 +75,31 @@ fn main() -> std::io::Result<()> {
     tracing::subscriber::set_global_default(tracing_subscriber).expect("setting default tracing subscriber failed");
 
     let filename = std::path::Path::new(&args.osm_file);
-    let file = std::fs::File::open(filename)?;
-    let metadata = std::fs::metadata(filename).unwrap();
-    let file_size = metadata.len();
-    let start_time = std::time::Instant::now();
-    let mut counting_reader = instrumented_reader::InstrumentedReader::with_callback(file, |bytes_read, file_pos| {
+
+    if args.baseline {
+        let file = std::fs::File::open(filename)?;
+        let metadata = std::fs::metadata(filename).unwrap();
+        let file_size = metadata.len();
+        let start_time = std::time::Instant::now();
+        let mut counting_reader = instrumented_reader::InstrumentedReader::with_callback(file, |bytes_read, file_pos| {
         let percentage = (file_pos as f64 / file_size as f64) * 100.0;
         print_progress(percentage, bytes_read, file_pos, start_time);
     });
-    let stream = std::io::BufReader::with_capacity(args.chunk_size, &mut counting_reader);
-
-    if args.baseline {
+        let stream = std::io::BufReader::with_capacity(args.chunk_size, &mut counting_reader);
         baseline(stream);
         return Ok(());
     }
     
-    let mut osmstream = OsmStream::new(stream);
-
-    if args.skip_blobs > 0 {
-        let mut blob_iterator = osmstream.blobs();
-        for _ in 0..args.skip_blobs {
-            match blob_iterator.next() {
-                Some(Ok(_)) => {},
-                Some(Err(e)) => return Err(e),
-                None => break,
-            }
-        }
-
-    }
-
-    if args.count_blobs {
-        let mut blob_count = 0;
-        let mut header_count = 0;
-        let mut data_count = 0;
-        
-        for blob_result in osmstream.blobs() {
-            let blob = blob_result?;
-            blob_count += 1;
-            match blob.blob_type.as_str() {
-                "OSMHeader" => header_count += 1,
-                "OSMData" => data_count += 1,
-                _ => {}
-            }
-        }
-        
-        println!("\nSummary:");
-        println!("  Total blobs: {}", blob_count);
-        println!("  Header blobs: {}", header_count);
-        println!("  Data blobs: {}", data_count);
-        return Ok(());
-    }
-
     if args.count_nodes {
-        if args.threads == 0 {
+        let node_count = if args.threads == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Thread count cannot be zero"));
-
         } else if args.threads == 1 {
-            // Sequential processing
-            let mut node_count = 0;
-            for node in osmstream.nodes() {
-                node_count += 1;
-            }
-            println!("\nTotal entities: {}", node_count);
+            process_nodes_sequential(filename, args.chunk_size, args.skip_blobs, |_node| { 1 }, 0, |acc, v| acc + v)
         } else {
-            // Parallel processing
-            // Collect blob positions (skip headers and apply skip_blobs)
-            let blob_infos: Vec<_> = osmstream.blobs()
-                .filter_map(|r| r.ok())
-                .filter(|b| b.blob_type == "OSMData")
-                .skip(args.skip_blobs)
-                .collect();
-            
-            let num_threads = args.threads.min(blob_infos.len());
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .build_global()
-                .unwrap();
-            
-            // Partition blobs into contiguous chunks, one per thread
-            let blobs_per_thread = (blob_infos.len() + num_threads - 1) / num_threads;
-            let mut blob_chunks: Vec<Vec<_>> = Vec::with_capacity(num_threads);
-            for i in 0..num_threads {
-                let start = i * blobs_per_thread;
-                let end = ((i + 1) * blobs_per_thread).min(blob_infos.len());
-                if start < blob_infos.len() {
-                    blob_chunks.push(blob_infos[start..end].to_vec());
-                }
-            }
-            
-            info!("Using {} threads for parallel processing of {} blobs ({} blobs/thread)", 
-                  num_threads, blob_infos.len(), blobs_per_thread);
-            
-            // Thread positions for progress bar
-            let thread_status = Arc::new(Mutex::new(vec![ThreadStatus::default(); num_threads]));
-            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-            let running_clone = running.clone();
-            
-            // Spawn progress thread (as daemon)
-            let file_size = metadata.len();
-            let start_time = std::time::Instant::now();
-            let thread_status_clone = thread_status.clone();
-            let progress_handle = std::thread::spawn(move || {
-                while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let thread_status = thread_status_clone.lock().unwrap();
-                    print_progress_parallel(&thread_status, file_size, start_time);
-                }
-            });
-            
-            // Process blob chunks in parallel - each thread gets a contiguous slice
-            let total: usize = blob_chunks.par_iter().enumerate().map(|(thread_idx, chunk)| {
-                if chunk.is_empty() {
-                    return 0;
-                }
-                
-                let thread_status = thread_status.clone();
-                let file = std::fs::File::open(&filename).unwrap();
-                
-                // Calculate the contiguous range for this chunk
-                let start_pos = chunk[0].position;
-                let end_blob = &chunk[chunk.len() - 1];
-                let total_size = (end_blob.position + end_blob.size) - start_pos;
-                
-                // Set the starting position for this thread
-                {
-                    let mut status = thread_status.lock().unwrap();
-                    status[thread_idx].start_pos = start_pos;
-                    status[thread_idx].file_pos = start_pos;
-                }
-                
-                // Wrap file in InstrumentedReader to track position
-                let instrumented = instrumented_reader::InstrumentedReader::with_frequency(
-                    file,
-                    1024 * 1024, // Update every 1MB
-                    move |bytes_read, file_pos| {
-                        let mut status = thread_status.lock().unwrap();
-                        status[thread_idx].file_pos = file_pos;
-                        status[thread_idx].bytes_read = bytes_read;
-                    }
-                );
-                
-                // Seek to start of this chunk and create a Take reader for the entire range
-                let mut seekable = instrumented;
-                seekable.seek(std::io::SeekFrom::Start(start_pos)).unwrap();
-                let limited = seekable.take(total_size);
-                
-                let reader = std::io::BufReader::with_capacity(args.chunk_size, limited);
-                let mut stream = OsmStream::new(reader);
-                
-                // Count all nodes in this contiguous chunk
-                let mut chunk_count = 0;
-                for _node in stream.nodes() {
-                    chunk_count += 1;
-                }
-                chunk_count
-            }).sum();
+            process_nodes_parallel(filename, args.chunk_size, args.blob_scan_chunk_size, args.skip_blobs, args.threads, |_node| { 1 }, 0, |acc, v| acc + v)
+        };
 
-            running.store(false, std::sync::atomic::Ordering::Relaxed);
-            progress_handle.join().unwrap();
-            
-            println!("\nTotal entities: {}", total);
-        }
+        println!("\nTotal entities: {}", node_count);
     }
 
     Ok(())
@@ -245,6 +113,141 @@ fn baseline<R: std::io::Read>(mut reader: R) {
             break;
         }
     }
+}
+
+fn process_nodes_sequential<T1, T2, F1: Fn(RawOsmNode) -> T1, F2: Fn(T2, T1) -> T2>(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize, map_callback: F1, fold_initial: T2, fold_callback: F2) -> T2 {
+    let file = std::fs::File::open(filename).unwrap();
+    let metadata = std::fs::metadata(filename).unwrap();
+    let file_size = metadata.len();
+    let start_time = std::time::Instant::now();
+    let counting_reader = instrumented_reader::InstrumentedReader::with_callback(file, |bytes_read, file_pos| {
+        let percentage = (file_pos as f64 / file_size as f64) * 100.0;
+        print_progress(percentage, bytes_read, file_pos, start_time);
+    });
+    let buf_reader = std::io::BufReader::with_capacity(chunk_size, counting_reader);
+    let mut osmstream = OsmStream::new(buf_reader);
+
+    let mut blob_iterator = osmstream.blobs();
+    for _ in 0..skip_blobs {
+        match blob_iterator.next() {
+            Some(Ok(_)) => {},
+            Some(Err(e)) => panic!("Error skipping blob: {}", e),
+            None => break,
+        }
+    }
+    osmstream.nodes().map(map_callback).fold(fold_initial, fold_callback)
+}
+
+fn process_nodes_parallel<T: Sync + Send + Copy, F1: Fn(RawOsmNode) -> T + Sync + Send + Copy, F2: Fn(T, T) -> T + Sync + Send + Copy>(filename: &std::path::Path, chunk_size: usize, blob_scan_chunk_size: usize, skip_blobs: usize, n_threads: usize, map_callback: F1, fold_initial: T, fold_callback: F2) -> T {
+    // Parallel processing
+    // Collect blob positions (skip headers and apply skip_blobs)
+    let blob_infos = scan_blobs(filename, blob_scan_chunk_size, skip_blobs);
+    
+    let num_threads = n_threads.min(blob_infos.len());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+    
+    // Partition blobs into contiguous chunks, one per thread
+    let blobs_per_thread = (blob_infos.len() + num_threads - 1) / num_threads;
+    let mut blob_chunks: Vec<Vec<_>> = Vec::with_capacity(num_threads);
+    for i in 0..num_threads {
+        let start = i * blobs_per_thread;
+        let end = ((i + 1) * blobs_per_thread).min(blob_infos.len());
+        if start < blob_infos.len() {
+            blob_chunks.push(blob_infos[start..end].to_vec());
+        }
+    }
+    
+    info!("Using {} threads for parallel processing of {} blobs ({} blobs/thread)", 
+            num_threads, blob_infos.len(), blobs_per_thread);
+    
+    // Thread positions for progress bar
+    let thread_status = Arc::new(Mutex::new(vec![ThreadStatus::default(); num_threads]));
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let running_clone = running.clone();
+    
+    // Spawn progress thread
+    let metadata = std::fs::metadata(filename).unwrap();
+    let file_size = metadata.len();
+    let start_time = std::time::Instant::now();
+    let thread_status_clone = thread_status.clone();
+    let progress_handle = std::thread::spawn(move || {
+        while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let thread_status = thread_status_clone.lock().unwrap();
+            print_progress_parallel(&thread_status, file_size, start_time);
+        }
+    });
+    
+    // Process blob chunks in parallel - each thread gets a contiguous slice
+    let result = blob_chunks.par_iter().enumerate().filter_map(|(thread_idx, chunk)| {
+        if chunk.is_empty() {
+            return None;
+        }
+        
+        let thread_status = thread_status.clone();
+        let file = std::fs::File::open(&filename).unwrap();
+        
+        // Calculate the contiguous range for this chunk
+        let start_pos = chunk[0].position;
+        let end_blob = &chunk[chunk.len() - 1];
+        let total_size = (end_blob.position + end_blob.size) - start_pos;
+        
+        // Set the starting position for this thread
+        {
+            let mut status = thread_status.lock().unwrap();
+            status[thread_idx].start_pos = start_pos;
+            status[thread_idx].file_pos = start_pos;
+        }
+        
+        // Wrap file in InstrumentedReader to track position
+        let mut instrumented = instrumented_reader::InstrumentedReader::with_frequency(
+            file,
+            1024 * 1024, // Update every 1MB
+            move |bytes_read, file_pos| {
+                let mut status = thread_status.lock().unwrap();
+                status[thread_idx].file_pos = file_pos;
+                status[thread_idx].bytes_read = bytes_read;
+            }
+        );
+        
+        // Seek to start of this chunk and create a Take reader for the entire range
+        instrumented.seek(std::io::SeekFrom::Start(start_pos)).unwrap();
+        let limited = instrumented.take(total_size);
+        
+        let reader = std::io::BufReader::with_capacity(chunk_size, limited);
+        let mut stream = OsmStream::new(reader);
+        
+        // Count all nodes in this contiguous chunk
+        Some(stream.nodes().map(map_callback).fold(fold_initial, fold_callback))
+    }).reduce(|| fold_initial, |acc, item| fold_callback(acc, item));
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    progress_handle.join().unwrap();
+    result
+}
+
+fn scan_blobs(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize) -> Vec<BlobInfo> {
+    let file = std::fs::File::open(filename).unwrap();
+    let metadata = std::fs::metadata(filename).unwrap();
+    let file_size = metadata.len();
+    let start_time = std::time::Instant::now();
+    let instrumented = instrumented_reader::InstrumentedReader::with_frequency(
+        file,
+        chunk_size as u64,
+         |bytes_read, file_pos| {
+            let percentage = (file_pos as f64 / file_size as f64) * 100.0;
+            print_progress(percentage, bytes_read, file_pos, start_time);
+    });
+    let stream = std::io::BufReader::with_capacity(chunk_size, instrumented);
+    let mut osmstream = OsmStream::new(stream);
+    osmstream.blobs()
+        .filter_map(|r| r.ok())
+        .filter(|b| b.blob_type == "OSMData")
+        .skip(skip_blobs)
+        .collect()
 }
 
 fn print_progress(percentage: f64, bytes_read: u64, file_pos: u64, start_time: std::time::Instant) {

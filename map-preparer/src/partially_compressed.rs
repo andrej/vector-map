@@ -1,6 +1,5 @@
-use std::io::{Read, BufRead, Seek};
 use flate2::bufread::ZlibDecoder;
-
+use std::io::{BufRead, Read, Seek};
 
 // --------------------------------------------------------------------------
 // PartiallyCompressedStream
@@ -27,7 +26,10 @@ impl<R: Read + BufRead> PartiallyCompressedStream<R> {
     }
 
     pub fn is_compressed(&self) -> bool {
-        matches!(self.stream, PartiallyCompressedStreamReader::ZlibCompressed(_))
+        matches!(
+            self.stream,
+            PartiallyCompressedStreamReader::ZlibCompressed(_)
+        )
     }
 }
 
@@ -44,8 +46,13 @@ impl<R: Read + BufRead> Read for PartiallyCompressedStream<R> {
         while remaining_buf.len() > 0 {
             let n_read = match &mut self.stream {
                 PartiallyCompressedStreamReader::Uncompressed(reader) => reader.read(remaining_buf),
-                PartiallyCompressedStreamReader::ZlibCompressed(decoder) => decoder.read(remaining_buf),
-                _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "Reading from an uninitialized stream is not supported")),
+                PartiallyCompressedStreamReader::ZlibCompressed(decoder) => {
+                    decoder.read(remaining_buf)
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Reading from an uninitialized stream is not supported",
+                )),
             }?;
             if n_read == 0 {
                 if let PartiallyCompressedStreamReader::ZlibCompressed(_) = &self.stream {
@@ -55,7 +62,7 @@ impl<R: Read + BufRead> Read for PartiallyCompressedStream<R> {
                     continue;
                 }
                 // EOF in uncompressed stream, meaning end of stream -- we should forward the EOF signal
-                break; 
+                break;
             }
             remaining_buf = &mut remaining_buf[n_read..];
             n_read_total += n_read;
@@ -76,7 +83,6 @@ impl<R: Read + BufRead + Seek> Seek for PartiallyCompressedStream<R> {
     }
 }
 
-
 // --------------------------------------------------------------------------
 // PartiallyCompressedStreamReader
 // --------------------------------------------------------------------------
@@ -91,7 +97,9 @@ pub enum PartiallyCompressedStreamReader<R: Read + BufRead> {
 impl<R: Read + BufRead> PartiallyCompressedStreamReader<R> {
     pub fn into_zlib_compressed(self, compressed_len: usize) -> PartiallyCompressedStreamReader<R> {
         if let PartiallyCompressedStreamReader::Uncompressed(reader) = self {
-            return PartiallyCompressedStreamReader::ZlibCompressed(ZlibDecoder::new(reader.take(compressed_len as u64)))
+            return PartiallyCompressedStreamReader::ZlibCompressed(ZlibDecoder::new(
+                reader.take(compressed_len as u64),
+            ));
         }
         panic!("into_zlib_compressed called on a stream that is not Uncompressed");
     }
@@ -108,7 +116,7 @@ impl<R: Read + BufRead> PartiallyCompressedStreamReader<R> {
             if inner_limited.limit() > 0 {
                 panic!("ZlibDecoder did not consume all underlying compressed bytes");
             }
-            return PartiallyCompressedStreamReader::Uncompressed(inner_limited.into_inner())
+            return PartiallyCompressedStreamReader::Uncompressed(inner_limited.into_inner());
         }
         panic!("into_uncompressed called on a stream that is not ZlibCompressed");
     }

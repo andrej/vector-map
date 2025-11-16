@@ -1,5 +1,5 @@
 use flate2::bufread::ZlibDecoder;
-use std::io::{BufRead, Read, Seek};
+use std::io::{BufRead, BufReader, Read, Seek};
 
 // --------------------------------------------------------------------------
 // PartiallyCompressedStream
@@ -71,6 +71,51 @@ impl<R: Read + BufRead> Read for PartiallyCompressedStream<R> {
     }
 }
 
+impl<R: Read + BufRead> BufRead for PartiallyCompressedStream<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        loop {
+            // Check if we need to transition from compressed to uncompressed
+            let needs_transition = match &mut self.stream {
+                PartiallyCompressedStreamReader::ZlibCompressed(decoder) => {
+                    decoder.fill_buf()?.is_empty()
+                }
+                _ => false,
+            };
+
+            if needs_transition {
+                // Reached the end of the compressed part of the stream
+                self.disable_compression();
+                // Loop around to try the uncompressed stream
+                continue;
+            }
+
+            // Now return the buffer
+            match &mut self.stream {
+                PartiallyCompressedStreamReader::Uncompressed(reader) => {
+                    return reader.fill_buf();
+                }
+                PartiallyCompressedStreamReader::ZlibCompressed(decoder) => {
+                    return decoder.fill_buf();
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "fill_buf on an uninitialized stream is not supported",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match &mut self.stream {
+            PartiallyCompressedStreamReader::Uncompressed(reader) => reader.consume(amt),
+            PartiallyCompressedStreamReader::ZlibCompressed(decoder) => decoder.consume(amt),
+            _ => panic!("consume on an uninitialized stream is not supported"),
+        }
+    }
+}
+
 impl<R: Read + BufRead + Seek> Seek for PartiallyCompressedStream<R> {
     /// Seeking is only supported in the uncompressed part of the stream.
     /// When in a compressed part, it is only allowed to seek by an amount of compressed bytes that leads outside of the compressed region;
@@ -91,27 +136,27 @@ impl<R: Read + BufRead + Seek> Seek for PartiallyCompressedStream<R> {
 pub enum PartiallyCompressedStreamReader<R: Read + BufRead> {
     Uninitialized,
     Uncompressed(R),
-    ZlibCompressed(ZlibDecoder<std::io::Take<R>>),
+    ZlibCompressed(BufReader<ZlibDecoder<std::io::Take<R>>>),
 }
 
 impl<R: Read + BufRead> PartiallyCompressedStreamReader<R> {
     pub fn into_zlib_compressed(self, compressed_len: usize) -> PartiallyCompressedStreamReader<R> {
         if let PartiallyCompressedStreamReader::Uncompressed(reader) = self {
-            return PartiallyCompressedStreamReader::ZlibCompressed(ZlibDecoder::new(
-                reader.take(compressed_len as u64),
-            ));
+            let decoder = ZlibDecoder::new(reader.take(compressed_len as u64));
+            return PartiallyCompressedStreamReader::ZlibCompressed(BufReader::new(decoder));
         }
         panic!("into_zlib_compressed called on a stream that is not Uncompressed");
     }
 
     pub fn into_uncompressed(self) -> PartiallyCompressedStreamReader<R> {
-        if let PartiallyCompressedStreamReader::ZlibCompressed(mut decoder) = self {
+        if let PartiallyCompressedStreamReader::ZlibCompressed(mut buf_decoder) = self {
             // It appears that the ZlibDecoder may still consume some bytes from the underlying stream even when returning zero bytes.
             // Perhaps there is some footer or checksum at the end of the compressed stream that needs to be read.
             // We need to advance the underlying stream to the end of the compressed part before returning it.
-            let Ok(0) = decoder.read(&mut []) else {
+            let Ok(0) = buf_decoder.read(&mut []) else {
                 panic!("into_uncompressed called on a ZlibCompressed stream that has not been fully read yet");
             };
+            let decoder = buf_decoder.into_inner();
             let inner_limited: std::io::Take<R> = decoder.into_inner();
             if inner_limited.limit() > 0 {
                 panic!("ZlibDecoder did not consume all underlying compressed bytes");

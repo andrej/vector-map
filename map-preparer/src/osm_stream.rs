@@ -37,6 +37,29 @@ pub struct RawOsmNode {
     pub kv: Vec<(Bytes, Bytes)>,
 }
 
+impl RawOsmNode {
+    /// Converts the encoded latitude and longitude to actual coordinates in degrees.
+    /// Returns (latitude, longitude) as a tuple of f64 values.
+    /// 
+    /// Formulas:
+    /// - latitude = .000000001 * (lat_offset + (granularity * lat))
+    /// - longitude = .000000001 * (lon_offset + (granularity * lon))
+    pub fn decode_coords(&self, lat_offset: i64, lon_offset: i64, granularity: i32) -> (f64, f64) {
+        let lat = 0.000000001 * ((lat_offset + (granularity as i64 * self.lat)) as f64);
+        let lon = 0.000000001 * ((lon_offset + (granularity as i64 * self.lon)) as f64);
+        (lat, lon)
+    }
+}
+
+/// An OSM node with decoded floating-point coordinates.
+#[derive(Debug, Clone)]
+pub struct OsmNode {
+    pub id: u64,
+    pub lat: f64,
+    pub lon: f64,
+    pub kv: Vec<(Bytes, Bytes)>,
+}
+
 #[derive(Debug)]
 pub struct RawOsmWay {}
 
@@ -61,6 +84,10 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         BlobIterator::new(self)
     }
 
+    pub fn raw_nodes<'a>(&'a mut self) -> RawNodeIterator<'a, R> {
+        RawNodeIterator::new(self)
+    }
+
     pub fn nodes<'a>(&'a mut self) -> NodeIterator<'a, R> {
         NodeIterator::new(self)
     }
@@ -75,25 +102,6 @@ pub struct BlobInfo {
     pub position: u64,
     /// Total size of this blob including the 4-byte header size, BlobHeader, and Blob data
     pub size: u64,
-}
-
-impl BlobInfo {
-    /// Create an OsmStream reader that is limited to reading just this blob.
-    /// The reader R must support seeking to the blob's position.
-    /// This creates a "reduced" OsmStream that will only process entities within this single blob.
-    ///
-    /// This is particularly useful for parallel processing, where each thread can open its own
-    /// file handle and create a reduced OsmStream for a specific blob.
-    pub fn create_reader<R: Read + BufRead + Seek>(
-        &self,
-        mut reader: R,
-    ) -> std::io::Result<OsmStream<std::io::Take<R>>> {
-        // Seek to the start of this blob
-        reader.seek(std::io::SeekFrom::Start(self.position))?;
-        // Use std::io::Take to limit reading to just this blob
-        let limited = reader.take(self.size);
-        Ok(OsmStream::new(limited))
-    }
 }
 
 /// Iterator that yields BlobInfo for each blob in the OSM PBF file.
@@ -171,17 +179,17 @@ impl<'a, R: Read + BufRead + Seek> Iterator for BlobIterator<'a, R> {
     }
 }
 
-pub struct NodeIterator<'a, R: Read + BufRead + Seek> {
+pub struct RawNodeIterator<'a, R: Read + BufRead + Seek> {
     stream: &'a mut OsmStream<R>,
 }
 
-impl<'a, R: Read + BufRead + Seek> NodeIterator<'a, R> {
+impl<'a, R: Read + BufRead + Seek> RawNodeIterator<'a, R> {
     pub fn new(stream: &'a mut OsmStream<R>) -> Self {
         Self { stream }
     }
 }
 
-impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
+impl<'a, R: Read + BufRead + Seek> Iterator for RawNodeIterator<'a, R> {
     type Item = RawOsmNode;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -203,6 +211,58 @@ impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
                     ..
                 } => {
                     return Some(node.clone());
+                }
+                OsmStreamState::End => {
+                    return None;
+                }
+                _ => {
+                    // Continue until state is one of the above two.
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+pub struct NodeIterator<'a, R: Read + BufRead + Seek> {
+    stream: &'a mut OsmStream<R>,
+}
+
+impl<'a, R: Read + BufRead + Seek> NodeIterator<'a, R> {
+    pub fn new(stream: &'a mut OsmStream<R>) -> Self {
+        Self { stream }
+    }
+}
+
+impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
+    type Item = OsmNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.stream.decode_next().unwrap();
+            match &self.stream.state {
+                OsmStreamState::ReadingBlob {
+                    state:
+                        ReadingBlobState::ReadingBlobData(
+                            ReadingBlobDataState::DecodingPrimitiveGroup {
+                                state:
+                                    DecodingPrimitiveGroupState::DecodingDenseNodes {
+                                        state: DecodingDenseNodesState::Decoding { node, .. },
+                                        ..
+                                    },
+                                info,
+                                ..
+                            },
+                        ),
+                    ..
+                } => {
+                    let (lat, lon) = node.decode_coords(info.lat_offset, info.lon_offset, info.granularity);
+                    return Some(OsmNode {
+                        id: node.id,
+                        lat,
+                        lon,
+                        kv: node.kv.clone(),
+                    });
                 }
                 OsmStreamState::End => {
                     return None;
@@ -1122,38 +1182,5 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             std::io::ErrorKind::Other,
             "Not implemented yet",
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn test_blob_info_with_reduced_readers() {
-        // This test demonstrates the concept of creating reduced OsmStream readers
-        // In a real scenario, you would use actual OSM PBF data
-
-        // Example: collecting blob infos (first pass)
-        // let file = std::fs::File::open("test.osm.pbf").unwrap();
-        // let reader = std::io::BufReader::new(file);
-        // let mut stream = OsmStream::new(reader);
-        //
-        // let blob_infos: Vec<BlobInfo> = stream.blobs()
-        //     .collect::<Result<Vec<_>, _>>()
-        //     .unwrap();
-        //
-        // Example: processing blobs independently (second pass)
-        // for blob_info in &blob_infos {
-        //     let file = std::fs::File::open("test.osm.pbf").unwrap();
-        //     let reader = std::io::BufReader::new(file);
-        //     let mut reduced_stream = blob_info.create_reader(reader).unwrap();
-        //
-        //     // This reduced_stream will only process entities from this one blob
-        //     for entity in reduced_stream {
-        //         // Process entity
-        //     }
-        // }
     }
 }

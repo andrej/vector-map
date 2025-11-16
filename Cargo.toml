@@ -1,2 +1,6 @@
 [workspace]
 members = ["webapp", "map-preparer"]
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

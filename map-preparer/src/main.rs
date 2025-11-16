@@ -5,14 +5,15 @@ mod partially_compressed;
 mod protobuf_helpers;
 
 use clap::Parser;
-use osm_stream::{BlobInfo, OsmStream, RawOsmNode};
+use osm_stream::{BlobInfo, OsmNode, OsmStream};
 use rayon::prelude::*;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 const CHUNK_SIZE: usize = 8192;
+const GRID_SIZE: usize = 1024;
 
 #[derive(clap::Parser)]
 struct ClArgs {
@@ -43,6 +44,14 @@ struct ClArgs {
     /// List entities in the file
     #[arg(long)]
     count_nodes: bool,
+
+    /// Generate a density grid from nodes
+    #[arg(long)]
+    density_grid: bool,
+
+    /// Output binary grid file path
+    #[arg(short = 'o', long = "output")]
+    output: Option<std::path::PathBuf>,
 
     /// Number of parallel threads for entity processing (0 = sequential)
     #[arg(short = 'j', long = "threads", default_value_t = 8)]
@@ -116,10 +125,74 @@ fn main() -> std::io::Result<()> {
                 |_node| 1,
                 0,
                 |acc, v| acc + v,
+                |acc1, acc2| acc1 + acc2,
             )
         };
 
         println!("\nTotal entities: {}", node_count);
+    }
+
+    if args.density_grid {
+        let output_path = args.output.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Output path (-o/--output) is required for grid generation",
+            )
+        })?;
+
+        let map_fn = |node: OsmNode| {
+            let (x, y) = latlon_to_web_mercator(node.lat, node.lon);
+            let grid_x = ((x * GRID_SIZE as f64).floor() as usize).min(GRID_SIZE - 1);
+            let grid_y = ((y * GRID_SIZE as f64).floor() as usize).min(GRID_SIZE - 1);
+            (grid_x, grid_y)
+        };
+
+        let fold_fn = |mut grid: Box<[[u32; GRID_SIZE]; GRID_SIZE]>, (x, y): (usize, usize)| {
+            grid[y][x] = grid[y][x].saturating_add(1);
+            grid
+        };
+
+        let merge_fn = |mut grid1: Box<[[u32; GRID_SIZE]; GRID_SIZE]>, 
+                        grid2: Box<[[u32; GRID_SIZE]; GRID_SIZE]>| {
+            for y in 0..GRID_SIZE {
+                for x in 0..GRID_SIZE {
+                    grid1[y][x] = grid1[y][x].saturating_add(grid2[y][x]);
+                }
+            }
+            grid1
+        };
+
+        let grid = if args.threads == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Thread count cannot be zero",
+            ));
+        } else if args.threads == 1 {
+            process_nodes_sequential(
+                filename,
+                args.chunk_size,
+                args.skip_blobs,
+                map_fn,
+                Box::new([[0u32; GRID_SIZE]; GRID_SIZE]),
+                fold_fn,
+            )
+        } else {
+            process_nodes_parallel(
+                filename,
+                args.chunk_size,
+                args.blob_scan_chunk_size,
+                args.skip_blobs,
+                args.threads,
+                map_fn,
+                Box::new([[0u32; GRID_SIZE]; GRID_SIZE]),
+                fold_fn,
+                merge_fn,
+            )
+        };
+
+        println!("\nSaving density grid to binary file...");
+        save_grid_to_file(&grid, output_path)?;
+        println!("Grid saved to: {}", output_path.display());
     }
 
     Ok(())
@@ -135,7 +208,7 @@ fn baseline<R: std::io::Read>(mut reader: R) {
     }
 }
 
-fn process_nodes_sequential<T1, T2, F1: Fn(RawOsmNode) -> T1, F2: Fn(T2, T1) -> T2>(
+fn process_nodes_sequential<T1, T2, F1: Fn(OsmNode) -> T1, F2: Fn(T2, T1) -> T2>(
     filename: &std::path::Path,
     chunk_size: usize,
     skip_blobs: usize,
@@ -170,9 +243,11 @@ fn process_nodes_sequential<T1, T2, F1: Fn(RawOsmNode) -> T1, F2: Fn(T2, T1) -> 
 }
 
 fn process_nodes_parallel<
-    T: Sync + Send + Copy,
-    F1: Fn(RawOsmNode) -> T + Sync + Send + Copy,
-    F2: Fn(T, T) -> T + Sync + Send + Copy,
+    T1: Sync + Send,
+    T2: Sync + Send + Clone,
+    F1: Fn(OsmNode) -> T1 + Sync + Send + Copy,
+    F2: Fn(T2, T1) -> T2 + Sync + Send + Copy,
+    F3: Fn(T2, T2) -> T2 + Sync + Send + Copy,
 >(
     filename: &std::path::Path,
     chunk_size: usize,
@@ -180,9 +255,10 @@ fn process_nodes_parallel<
     skip_blobs: usize,
     n_threads: usize,
     map_callback: F1,
-    fold_initial: T,
+    fold_initial: T2,
     fold_callback: F2,
-) -> T {
+    merge_callback: F3,
+) -> T2 {
     // Parallel processing
     // Collect blob positions (skip headers and apply skip_blobs)
     let blob_infos = scan_blobs(filename, blob_scan_chunk_size, skip_blobs);
@@ -278,10 +354,10 @@ fn process_nodes_parallel<
                 stream
                     .nodes()
                     .map(map_callback)
-                    .fold(fold_initial, fold_callback),
+                    .fold(fold_initial.clone(), fold_callback),
             )
         })
-        .reduce(|| fold_initial, |acc, item| fold_callback(acc, item));
+        .reduce(|| fold_initial.clone(), merge_callback);
 
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     progress_handle.join().unwrap();
@@ -383,4 +459,79 @@ fn print_progress_parallel(
         "\r[{}] {:>5.2}% {:>6.1} MiB/s",
         bar_str, read_percentage, throughput_mib
     );
+}
+
+/// Convert latitude/longitude to Web Mercator projection coordinates (0.0 to 1.0 range)
+/// Uses the standard Web Mercator projection (EPSG:3857)
+fn latlon_to_web_mercator(lat: f64, lon: f64) -> (f64, f64) {
+    // Clamp latitude to avoid infinity at poles
+    let lat = lat.clamp(-85.051129, 85.051129);
+    
+    // Longitude: -180 to 180 maps to 0 to 1
+    let x = (lon + 180.0) / 360.0;
+    
+    // Latitude: use Mercator projection formula
+    let lat_rad = lat.to_radians();
+    let y = (1.0 - ((lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0;
+    
+    (x, y)
+}
+
+/// Save a density grid to a binary file
+/// Format: 1024x1024 grid of u32 values in little-endian format
+fn save_grid_to_file(
+    grid: &Box<[[u32; GRID_SIZE]; GRID_SIZE]>,
+    output_path: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(output_path)?;
+    
+    // Write grid dimensions as header (for future compatibility)
+    file.write_all(&(GRID_SIZE as u32).to_le_bytes())?;
+    file.write_all(&(GRID_SIZE as u32).to_le_bytes())?;
+    
+    // Write all grid values as little-endian u32
+    for row in grid.iter() {
+        for &value in row.iter() {
+            file.write_all(&value.to_le_bytes())?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Load a density grid from a binary file
+pub fn load_grid_from_file(
+    input_path: &std::path::Path,
+) -> std::io::Result<Box<[[u32; GRID_SIZE]; GRID_SIZE]>> {
+    use std::io::Read;
+    
+    let mut file = std::fs::File::open(input_path)?;
+    
+    // Read header
+    let mut width_bytes = [0u8; 4];
+    let mut height_bytes = [0u8; 4];
+    file.read_exact(&mut width_bytes)?;
+    file.read_exact(&mut height_bytes)?;
+    
+    let width = u32::from_le_bytes(width_bytes) as usize;
+    let height = u32::from_le_bytes(height_bytes) as usize;
+    
+    if width != GRID_SIZE || height != GRID_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Grid dimensions {}x{} do not match expected {}x{}", width, height, GRID_SIZE, GRID_SIZE),
+        ));
+    }
+    
+    // Read grid values
+    let mut grid = Box::new([[0u32; GRID_SIZE]; GRID_SIZE]);
+    for row in grid.iter_mut() {
+        for value in row.iter_mut() {
+            let mut bytes = [0u8; 4];
+            file.read_exact(&mut bytes)?;
+            *value = u32::from_le_bytes(bytes);
+        }
+    }
+    
+    Ok(grid)
 }

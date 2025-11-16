@@ -120,18 +120,25 @@ pub fn decode_varint<R: BufRead>(
             }
         }
 
-        let byte = available[0];
-        stream.consume(1);
-        consumed += 1;
-
-        value |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            *out = value;
-            return Ok(Some(consumed));
+        let mut consumed_this_iter = 0;
+        let mut broke = false;
+        for byte in available {
+            consumed_this_iter += 1;
+            value |= ((byte & 0x7F) as u64) << shift;
+            if byte & 0x80 == 0 {
+                broke = true;
+                break;
+            }
+            shift += 7;
         }
 
-        shift += 7;
-        if shift > 63 {
+        stream.consume(consumed_this_iter);
+        consumed += consumed_this_iter;
+
+        if broke {
+            *out = value;
+            return Ok(Some(consumed));
+        } else if shift > 63 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Malformed varint: too long",

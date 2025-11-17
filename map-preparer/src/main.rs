@@ -470,16 +470,9 @@ fn latlon_to_web_mercator(lat: f64, lon: f64) -> (f64, f64) {
     // Longitude: -180 to 180 maps to 0 to 1
     let x = (lon + 180.0) / 360.0;
     
-    // Latitude: use optimized Mercator projection formula
-    // Original: y = (1.0 - ln(tan(lat_rad) + 1/cos(lat_rad)) / π) / 2.0
-    // Simplified using: tan(x) + sec(x) = (1 + sin(x)) / cos(x)
-    // Then: ln((1 + sin(x)) / cos(x)) = ln(1 + sin(x)) - ln(cos(x))
+    // Latitude: use Mercator projection formula
     let lat_rad = lat.to_radians();
-    let sin_lat = lat_rad.sin();
-    
-    // Equivalent to the standard formula but avoids tan() and reduces operations
-    // ln((1 + sin) / (1 - sin)) = ln(1 + sin) - ln(1 - sin)
-    let y = 0.5 - (0.5 * ((1.0 + sin_lat) / (1.0 - sin_lat)).ln() / std::f64::consts::PI);
+    let y = (1.0 - ((lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0;
     
     (x, y)
 }

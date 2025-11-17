@@ -14,6 +14,9 @@ use tracing_subscriber::FmtSubscriber;
 
 const CHUNK_SIZE: usize = 8192;
 const GRID_SIZE: usize = 1024;
+// Web Mercator practical latitude clamp to avoid infinite projection values at the poles.
+// This cutoff is chosen such that the resulting map is square.
+const MAX_MERCATOR_LAT: f64 = 85.051128;
 
 #[derive(clap::Parser)]
 struct ClArgs {
@@ -60,6 +63,10 @@ struct ClArgs {
     /// Verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbosity: u8,
+    // (No cell size; scale is derived to hit a target max dimension.)
+    /// Optional explicit Mercator scale (R). If omitted, a scale is chosen so max dimension ~= 1024.
+    #[arg(long = "scale")]
+    scale: Option<f64>,
 }
 
 #[derive(Default, Clone)]
@@ -67,6 +74,25 @@ struct ThreadStatus {
     bytes_read: u64,
     start_pos: u64,
     file_pos: u64,
+}
+
+/// Dynamic grid storing counts in row-major order.
+#[derive(Debug, Clone)]
+struct DynamicGrid {
+    width: usize,
+    height: usize,
+    data: Vec<u32>,
+}
+
+impl DynamicGrid {
+    fn new(width: usize, height: usize) -> Self {
+        Self { width, height, data: vec![0u32; width * height] }
+    }
+    #[inline]
+    fn inc(&mut self, x: usize, y: usize) {
+        let idx = y * self.width + x;
+        self.data[idx] = self.data[idx].saturating_add(1);
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -140,24 +166,39 @@ fn main() -> std::io::Result<()> {
             )
         })?;
 
-        let map_fn = |node: OsmNode| {
-            let (x, y) = latlon_to_web_mercator(node.lat, node.lon);
-            let grid_x = ((x * GRID_SIZE as f64).floor() as usize).min(GRID_SIZE - 1);
-            let grid_y = ((y * GRID_SIZE as f64).floor() as usize).min(GRID_SIZE - 1);
-            (grid_x, grid_y)
+        // Determine scale: user-specified or derived to meet target max dimension.
+        const TARGET_MAX: f64 = 1024.0;
+        let scale_r = args.scale.unwrap_or_else(|| compute_scale_for_target_max(TARGET_MAX));
+        let ((min_x, _), (min_y, _)) = mercator_bounds(scale_r);
+        let (width, height) = mercator_size(scale_r);
+        let grid_width = width.ceil() as usize;
+        let grid_height = height.ceil() as usize;
+        info!(
+            "Scale R {:.4} | width {:.2} height {:.2} -> grid {}x{}{}",
+            scale_r, width, height, grid_width, grid_height,
+            if args.scale.is_none() { " (auto)" } else { " (user)" }
+        );
+        println!("Generating {}x{} density grid (scale {:.4})...", grid_width, grid_height, scale_r);
+
+        // Closure maps a node's lat/lon into grid indices using real Mercator coordinates.
+        let map_fn = move |node: OsmNode| {
+            let (x_m, y_m) = latlon_to_web_mercator(node.lat, node.lon, scale_r);
+            let rel_x = x_m - min_x;
+            let rel_y = y_m - min_y;
+            let grid_x = (rel_x.trunc() as isize).clamp(0, (grid_width - 1) as isize);
+            let grid_y = (rel_y.trunc() as isize).clamp(0, (grid_height - 1) as isize);
+            (grid_x as usize, grid_y as usize)
         };
 
-        let fold_fn = |mut grid: Box<[[u32; GRID_SIZE]; GRID_SIZE]>, (x, y): (usize, usize)| {
-            grid[y][x] = grid[y][x].saturating_add(1);
+        let fold_fn = |mut grid: Box<DynamicGrid>, (x, y): (usize, usize)| {
+            grid.inc(x, y);
             grid
         };
 
-        let merge_fn = |mut grid1: Box<[[u32; GRID_SIZE]; GRID_SIZE]>, 
-                        grid2: Box<[[u32; GRID_SIZE]; GRID_SIZE]>| {
-            for y in 0..GRID_SIZE {
-                for x in 0..GRID_SIZE {
-                    grid1[y][x] = grid1[y][x].saturating_add(grid2[y][x]);
-                }
+        let merge_fn = |mut grid1: Box<DynamicGrid>, grid2: Box<DynamicGrid>| {
+            // Both grids have identical dimensions
+            for i in 0..grid1.data.len() {
+                grid1.data[i] = grid1.data[i].saturating_add(grid2.data[i]);
             }
             grid1
         };
@@ -173,7 +214,7 @@ fn main() -> std::io::Result<()> {
                 args.chunk_size,
                 args.skip_blobs,
                 map_fn,
-                Box::new([[0u32; GRID_SIZE]; GRID_SIZE]),
+                Box::new(DynamicGrid::new(grid_width, grid_height)),
                 fold_fn,
             )
         } else {
@@ -184,14 +225,14 @@ fn main() -> std::io::Result<()> {
                 args.skip_blobs,
                 args.threads,
                 map_fn,
-                Box::new([[0u32; GRID_SIZE]; GRID_SIZE]),
+                Box::new(DynamicGrid::new(grid_width, grid_height)),
                 fold_fn,
                 merge_fn,
             )
         };
 
         println!("\nSaving density grid to binary file...");
-        save_grid_to_file(&grid, output_path)?;
+        save_dynamic_grid_to_file(&grid, output_path)?;
         println!("Grid saved to: {}", output_path.display());
     }
 
@@ -461,77 +502,56 @@ fn print_progress_parallel(
     );
 }
 
-/// Convert latitude/longitude to Web Mercator projection coordinates (0.0 to 1.0 range)
-/// Uses the standard Web Mercator projection (EPSG:3857)
-fn latlon_to_web_mercator(lat: f64, lon: f64) -> (f64, f64) {
-    // Clamp latitude to avoid infinity at poles
-    let lat = lat.clamp(-85.051129, 85.051129);
-    
-    // Longitude: -180 to 180 maps to 0 to 1
-    let x = (lon + 180.0) / 360.0;
-    
-    // Latitude: use Mercator projection formula
+/// Convert latitude/longitude to Web Mercator projection coordinates in meters for a given scale (earth radius R).
+/// Uses the standard spherical Mercator (EPSG:3857) equations:
+///   x = R * λ
+///   y = R * ln(tan(π/4 + φ/2))
+/// Latitude is clamped to the Web Mercator practical limits (≈85.051129°) to avoid infinite values.
+fn latlon_to_web_mercator(lat: f64, lon: f64, r: f64) -> (f64, f64) {
+    let lat = lat.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
+    let lon_rad = lon.to_radians();
     let lat_rad = lat.to_radians();
-    let y = (1.0 - ((lat_rad.tan() + (1.0 / lat_rad.cos())).ln() / std::f64::consts::PI)) / 2.0;
-    
+    let x = r * lon_rad;
+    let y = r * ( (std::f64::consts::PI / 4.0 + lat_rad / 2.0).tan().ln() );
     (x, y)
 }
 
-/// Save a density grid to a binary file
-/// Format: 1024x1024 grid of u32 values in little-endian format
-fn save_grid_to_file(
-    grid: &Box<[[u32; GRID_SIZE]; GRID_SIZE]>,
+/// Return the Mercator projection bounds (min_x, max_x), (min_y, max_y) for a given scale (earth radius R).
+/// X spans [-πR, πR]. Y spans symmetric range based on clamped latitude.
+fn mercator_bounds(r: f64) -> ((f64, f64), (f64, f64)) {
+    let max_x = std::f64::consts::PI * r;
+    let min_x = -max_x;
+    let max_lat_rad = MAX_MERCATOR_LAT.to_radians();
+    let max_y = r * ( (std::f64::consts::PI / 4.0 + max_lat_rad / 2.0).tan().ln() );
+    let min_y = -max_y;
+    ((min_x, max_x), (min_y, max_y))
+}
+
+/// Return the (width, height) of the full Mercator world for scale (earth radius R).
+/// Width = 2πR, Height = 2 * R * ln(tan(π/4 + φ_max/2)).
+fn mercator_size(r: f64) -> (f64, f64) {
+    let ((min_x, max_x), (min_y, max_y)) = mercator_bounds(r);
+    (max_x - min_x, max_y - min_y)
+}
+
+/// Compute scale R so that max(world_width, world_height) == target_max (approximately).
+/// world_width = 2πR, world_height = 2R * ln(tan(π/4 + φ_max/2)). Width is larger, so we just use width.
+fn compute_scale_for_target_max(target_max: f64) -> f64 {
+    // Since width coefficient (2π) > height coefficient, using width achieves target on larger dimension.
+    target_max / (2.0 * std::f64::consts::PI)
+}
+
+/// Save a dynamic density grid to a binary file
+/// Format: u32 width, u32 height, followed by width*height little-endian u32 counts row-major
+fn save_dynamic_grid_to_file(
+    grid: &DynamicGrid,
     output_path: &std::path::Path,
 ) -> std::io::Result<()> {
     let mut file = std::fs::File::create(output_path)?;
-    
-    // Write grid dimensions as header (for future compatibility)
-    file.write_all(&(GRID_SIZE as u32).to_le_bytes())?;
-    file.write_all(&(GRID_SIZE as u32).to_le_bytes())?;
-    
-    // Write all grid values as little-endian u32
-    for row in grid.iter() {
-        for &value in row.iter() {
-            file.write_all(&value.to_le_bytes())?;
-        }
+    file.write_all(&(grid.width as u32).to_le_bytes())?;
+    file.write_all(&(grid.height as u32).to_le_bytes())?;
+    for &value in grid.data.iter() {
+        file.write_all(&value.to_le_bytes())?;
     }
-    
     Ok(())
-}
-
-/// Load a density grid from a binary file
-pub fn load_grid_from_file(
-    input_path: &std::path::Path,
-) -> std::io::Result<Box<[[u32; GRID_SIZE]; GRID_SIZE]>> {
-    use std::io::Read;
-    
-    let mut file = std::fs::File::open(input_path)?;
-    
-    // Read header
-    let mut width_bytes = [0u8; 4];
-    let mut height_bytes = [0u8; 4];
-    file.read_exact(&mut width_bytes)?;
-    file.read_exact(&mut height_bytes)?;
-    
-    let width = u32::from_le_bytes(width_bytes) as usize;
-    let height = u32::from_le_bytes(height_bytes) as usize;
-    
-    if width != GRID_SIZE || height != GRID_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Grid dimensions {}x{} do not match expected {}x{}", width, height, GRID_SIZE, GRID_SIZE),
-        ));
-    }
-    
-    // Read grid values
-    let mut grid = Box::new([[0u32; GRID_SIZE]; GRID_SIZE]);
-    for row in grid.iter_mut() {
-        for value in row.iter_mut() {
-            let mut bytes = [0u8; 4];
-            file.read_exact(&mut bytes)?;
-            *value = u32::from_le_bytes(bytes);
-        }
-    }
-    
-    Ok(grid)
 }

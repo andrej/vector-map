@@ -33,7 +33,7 @@ struct ClArgs {
     blob_scan_chunk_size: usize,
 
     /// Buffer chunk size in bytes
-    #[arg(short = 'c', long = "chunk-size", default_value_t = 16384)]
+    #[arg(short = 'c', long = "chunk-size", default_value_t = 524288)]
     chunk_size: usize,
 
     /// Skip the first N blobs.
@@ -57,7 +57,7 @@ struct ClArgs {
     output: Option<std::path::PathBuf>,
 
     /// Number of parallel threads for entity processing (0 = sequential)
-    #[arg(short = 'j', long = "threads", default_value_t = 8)]
+    #[arg(short = 'j', long = "threads", default_value_t = 10)]
     threads: usize,
 
     /// Verbosity
@@ -180,14 +180,25 @@ fn main() -> std::io::Result<()> {
         );
         println!("Generating {}x{} density grid (scale {:.4})...", grid_width, grid_height, scale_r);
 
-        // Closure maps a node's lat/lon into grid indices using real Mercator coordinates.
+        // Precompute latitude -> y-bin lookup to avoid per-node trig/log; and degree-based x scaling.
+        let lat_samples_per_degree = compute_lat_samples_per_degree(scale_r).max(1);
+        let lat_lut = build_lat_to_ybin_lut(scale_r, min_y, grid_height, lat_samples_per_degree);
+        let lat_index_offset = (90 * lat_samples_per_degree) as isize; // shift [-90,90] to [0, 180*samples]
+        let lon_scale_per_degree = scale_r * std::f64::consts::PI / 180.0; // R * pi / 180
+        let x_offset = -min_x; // equals πR; rel_x = x - min_x = R*λ + πR
+
+        // Closure maps a node's lat/lon into grid indices using lookup and simple scaling.
         let map_fn = move |node: OsmNode| {
-            let (x_m, y_m) = latlon_to_web_mercator(node.lat, node.lon, scale_r);
-            let rel_x = x_m - min_x;
-            let rel_y = y_m - min_y;
-            let grid_x = (rel_x.trunc() as isize).clamp(0, (grid_width - 1) as isize);
-            let grid_y = (rel_y.trunc() as isize).clamp(0, (grid_height - 1) as isize);
-            (grid_x as usize, grid_y as usize)
+            latlon_to_web_mercator_bins(
+                node.lat,
+                node.lon,
+                lon_scale_per_degree,
+                x_offset,
+                grid_width,
+                lat_samples_per_degree,
+                lat_index_offset,
+                &lat_lut,
+            )
         };
 
         let fold_fn = |mut grid: Box<DynamicGrid>, (x, y): (usize, usize)| {
@@ -286,9 +297,9 @@ fn process_nodes_sequential<T1, T2, F1: Fn(OsmNode) -> T1, F2: Fn(T2, T1) -> T2>
 fn process_nodes_parallel<
     T1: Sync + Send,
     T2: Sync + Send + Clone,
-    F1: Fn(OsmNode) -> T1 + Sync + Send + Copy,
-    F2: Fn(T2, T1) -> T2 + Sync + Send + Copy,
-    F3: Fn(T2, T2) -> T2 + Sync + Send + Copy,
+    F1: Fn(OsmNode) -> T1 + Sync + Send,
+    F2: Fn(T2, T1) -> T2 + Sync + Send,
+    F3: Fn(T2, T2) -> T2 + Sync + Send,
 >(
     filename: &std::path::Path,
     chunk_size: usize,
@@ -340,14 +351,16 @@ fn process_nodes_parallel<
     let thread_status_clone = thread_status.clone();
     let progress_handle = std::thread::spawn(move || {
         while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(333));  // 3 times per second
             let thread_status = thread_status_clone.lock().unwrap();
             print_progress_parallel(&thread_status, file_size, start_time);
         }
     });
 
+    let start_time = std::time::Instant::now();
+
     // Process blob chunks in parallel - each thread gets a contiguous slice
-    let result = blob_chunks
+    let (n_nodes, result) = blob_chunks
         .par_iter()
         .enumerate()
         .filter_map(|(thread_idx, chunk)| {
@@ -373,7 +386,7 @@ fn process_nodes_parallel<
             // Wrap file in InstrumentedReader to track position
             let mut instrumented = instrumented_reader::InstrumentedReader::with_frequency(
                 file,
-                1024 * 1024, // Update every 1MB
+                10 * 1024 * 1024,  // 10 MiB -- FIXME: somehow throughput goes up when we update _more_ frequently?!
                 move |bytes_read, file_pos| {
                     let mut status = thread_status.lock().unwrap();
                     status[thread_idx].file_pos = file_pos;
@@ -394,14 +407,20 @@ fn process_nodes_parallel<
             Some(
                 stream
                     .nodes()
-                    .map(map_callback)
-                    .fold(fold_initial.clone(), fold_callback),
+                    .map(&map_callback)
+                    .fold((0, fold_initial.clone()), |acc, item| (acc.0 + 1, fold_callback(acc.1, item))),
             )
         })
-        .reduce(|| fold_initial.clone(), merge_callback);
+        .reduce(|| (0, fold_initial.clone()), |acc, item| (acc.0 + item.0, merge_callback(acc.1, item.1)));
 
     running.store(false, std::sync::atomic::Ordering::Relaxed);
     progress_handle.join().unwrap();
+    
+    println!(
+        "\nProcessed {} nodes in {:.3} s.",
+        n_nodes,
+        start_time.elapsed().as_secs_f64()
+    );
     result
 }
 
@@ -412,7 +431,7 @@ fn scan_blobs(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize) 
     let start_time = std::time::Instant::now();
     let instrumented = instrumented_reader::InstrumentedReader::with_frequency(
         file,
-        chunk_size as u64,
+       1024 * 1024,
         |bytes_read, file_pos| {
             let percentage = (file_pos as f64 / file_size as f64) * 100.0;
             print_progress(percentage, bytes_read, file_pos, start_time);
@@ -420,12 +439,17 @@ fn scan_blobs(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize) 
     );
     let stream = std::io::BufReader::with_capacity(chunk_size, instrumented);
     let mut osmstream = OsmStream::new(stream);
-    osmstream
+
+    let start_time = std::time::Instant::now();
+    let result: Vec<_>  = osmstream
         .blobs()
         .filter_map(|r| r.ok())
         .filter(|b| b.blob_type == "OSMData")
         .skip(skip_blobs)
-        .collect()
+        .collect();
+    println!("\nScanned {} blobs in {:.3} s.", result.len(), start_time.elapsed().as_secs_f64());
+
+    result
 }
 
 fn print_progress(percentage: f64, bytes_read: u64, file_pos: u64, start_time: std::time::Instant) {
@@ -539,6 +563,65 @@ fn mercator_size(r: f64) -> (f64, f64) {
 fn compute_scale_for_target_max(target_max: f64) -> f64 {
     // Since width coefficient (2π) > height coefficient, using width achieves target on larger dimension.
     target_max / (2.0 * std::f64::consts::PI)
+}
+
+/// Compute minimum samples-per-degree for latitude lookup to ensure each table step
+/// moves at most one y-bin across the entire latitude range (worst case at MAX_MERCATOR_LAT).
+fn compute_lat_samples_per_degree(r: f64) -> usize {
+    let sec_max = 1.0 / MAX_MERCATOR_LAT.to_radians().cos();
+    // dy/ddeg = R * 0.5 * sec(lat) * (π/180)
+    let dy_per_degree_max = r * 0.5 * sec_max * (std::f64::consts::PI / 180.0);
+    // Require dy per table step <= 1 bin => steps_per_degree >= dy_per_degree_max
+    dy_per_degree_max.ceil() as usize
+}
+
+/// Build a lookup table mapping latitude (indexed by scaled degrees) to y-bin index.
+/// Table index i corresponds to lat_deg = i / samples_per_degree - 90.
+fn build_lat_to_ybin_lut(
+    r: f64,
+    min_y: f64,
+    grid_height: usize,
+    samples_per_degree: usize,
+) -> Vec<usize> {
+    let total_indices = 180 * samples_per_degree + 1; // include endpoint
+    let mut lut = Vec::with_capacity(total_indices);
+    for i in 0..total_indices {
+        let lat_deg = (i as f64) / (samples_per_degree as f64) - 90.0;
+        let lat_clamped = lat_deg.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
+        let lat_rad = lat_clamped.to_radians();
+        let y = r * ((std::f64::consts::PI / 4.0 + lat_rad / 2.0).tan().ln());  // Mercator projection y for lat_rad
+        let rel_y = y - min_y;
+        let mut y_bin = rel_y.trunc() as isize;
+        y_bin = y_bin.clamp(0, (grid_height - 1) as isize);
+        lut.push(y_bin as usize);
+    }
+    lut
+}
+
+/// Fast mapping from latitude/longitude (degrees) to grid bins using precomputed LUT for latitude
+/// and linear degree-based scaling for longitude.
+fn latlon_to_web_mercator_bins(
+    lat_deg: f64,
+    lon_deg: f64,
+    lon_scale_per_degree: f64,
+    x_offset: f64,
+    grid_width: usize,
+    lat_samples_per_degree: usize,
+    lat_index_offset: isize,
+    lat_lut: &[usize],
+) -> (usize, usize) {
+    // X bin: rel_x = (R * π / 180) * lon_deg + πR; index = floor(rel_x)
+    let mut x_bin = (lon_scale_per_degree * lon_deg + x_offset).trunc() as isize;
+    x_bin = x_bin.clamp(0, (grid_width - 1) as isize);
+
+    // Y bin from LUT: index by scaled degrees with offset
+    let mut idx = ((lat_deg * lat_samples_per_degree as f64).trunc() as isize) + lat_index_offset;
+    // Clamp to table range
+    if idx < 0 { idx = 0; }
+    if idx as usize >= lat_lut.len() { idx = (lat_lut.len() - 1) as isize; }
+    let y_bin = lat_lut[idx as usize];
+
+    (x_bin as usize, y_bin)
 }
 
 /// Save a dynamic density grid to a binary file

@@ -62,41 +62,11 @@ where
         }
     }
 
-    /// Returns the total number of bytes read so far.
-    pub fn total_read(&self) -> u64 {
-        self.total_read
-    }
-
-    /// Returns the frequency (in bytes) at which the callback is invoked.
-    pub fn frequency(&self) -> u64 {
-        self.frequency
-    }
-
-    /// Gets a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        &self.inner
-    }
-
-    /// Gets a mutable reference to the underlying reader.
-    pub fn get_mut(&mut self) -> &mut R {
-        &mut self.inner
-    }
-
-    /// Consumes the wrapper and returns the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.inner
-    }
-
+    #[inline]
     fn maybe_fire_callbacks(&mut self) {
         while self.total_read >= self.next_threshold {
             (self.callback)(self.total_read, self.position);
-            // Avoid overflow in extremely long streams (practically unreachable)
-            let next = self.next_threshold.saturating_add(self.frequency);
-            if next <= self.next_threshold {
-                // overflow or frequency == 0 (guarded above)
-                break;
-            }
-            self.next_threshold = next;
+            self.next_threshold += self.frequency;
         }
     }
 }
@@ -109,8 +79,8 @@ where
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.total_read = self.total_read.saturating_add(n as u64);
-            self.position = self.position.saturating_add(n as u64);
+            self.total_read += n as u64;
+            self.position += n as u64;
             self.maybe_fire_callbacks();
         }
         Ok(n)
@@ -119,8 +89,8 @@ where
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         let n = self.inner.read_vectored(bufs)?;
         if n > 0 {
-            self.total_read = self.total_read.saturating_add(n as u64);
-            self.position = self.position.saturating_add(n as u64);
+            self.total_read += n as u64;
+            self.position += n as u64;
             self.maybe_fire_callbacks();
         }
         Ok(n)

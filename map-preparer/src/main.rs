@@ -8,12 +8,12 @@ use clap::Parser;
 use osm_stream::{BlobInfo, OsmNode, OsmStream};
 use rayon::prelude::*;
 use std::io::{Read, Seek, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 const CHUNK_SIZE: usize = 8192;
-const GRID_SIZE: usize = 1024;
 // Web Mercator practical latitude clamp to avoid infinite projection values at the poles.
 // This cutoff is chosen such that the resulting map is square.
 const MAX_MERCATOR_LAT: f64 = 85.051128;
@@ -60,20 +60,33 @@ struct ClArgs {
     #[arg(short = 'j', long = "threads", default_value_t = 10)]
     threads: usize,
 
+    /// Number of chunks per thread for load balancing
+    #[arg(long = "chunks-per-thread", default_value_t = 4)]
+    chunks_per_thread: usize,
+
     /// Verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbosity: u8,
-    // (No cell size; scale is derived to hit a target max dimension.)
+
     /// Optional explicit Mercator scale (R). If omitted, a scale is chosen so max dimension ~= 1024.
     #[arg(long = "scale")]
     scale: Option<f64>,
 }
 
-#[derive(Default, Clone)]
 struct ThreadStatus {
-    bytes_read: u64,
-    start_pos: u64,
-    file_pos: u64,
+    total_bytes_completed: AtomicU64,  // Bytes read from already completed chunks
+    current_chunk_start: AtomicU64,
+    current_chunk_pos: AtomicU64,
+}
+
+impl ThreadStatus {
+    fn new() -> Self {
+        Self {
+            total_bytes_completed: AtomicU64::new(0),
+            current_chunk_start: AtomicU64::new(0),
+            current_chunk_pos: AtomicU64::new(0),
+        }
+    }
 }
 
 /// Dynamic grid storing counts in row-major order.
@@ -148,6 +161,7 @@ fn main() -> std::io::Result<()> {
                 args.blob_scan_chunk_size,
                 args.skip_blobs,
                 args.threads,
+                args.chunks_per_thread,
                 |_node| 1,
                 0,
                 |acc, v| acc + v,
@@ -235,6 +249,7 @@ fn main() -> std::io::Result<()> {
                 args.blob_scan_chunk_size,
                 args.skip_blobs,
                 args.threads,
+                args.chunks_per_thread,
                 map_fn,
                 Box::new(DynamicGrid::new(grid_width, grid_height)),
                 fold_fn,
@@ -306,6 +321,7 @@ fn process_nodes_parallel<
     blob_scan_chunk_size: usize,
     skip_blobs: usize,
     n_threads: usize,
+    chunks_per_thread: usize,
     map_callback: F1,
     fold_initial: T2,
     fold_callback: F2,
@@ -322,38 +338,41 @@ fn process_nodes_parallel<
         .unwrap();
 
     // Partition blobs into contiguous chunks, one per thread
-    let blobs_per_thread = (blob_infos.len() + num_threads - 1) / num_threads;
-    let mut blob_chunks: Vec<Vec<_>> = Vec::with_capacity(num_threads);
-    for i in 0..num_threads {
-        let start = i * blobs_per_thread;
-        let end = ((i + 1) * blobs_per_thread).min(blob_infos.len());
+    // Each thread processes multiple chunks to improve load balancing (chunks aren't the same size, so when a thread finishes early it can pick up another)
+    let blobs_per_chunk = (blob_infos.len() + num_threads - 1) / num_threads / chunks_per_thread;
+    let mut blob_chunks: Vec<Vec<_>> = Vec::with_capacity(num_threads * chunks_per_thread);
+    for i in 0..(num_threads * chunks_per_thread) {
+        let start = i * blobs_per_chunk;
+        let end = ((i + 1) * blobs_per_chunk).min(blob_infos.len());
         if start < blob_infos.len() {
             blob_chunks.push(blob_infos[start..end].to_vec());
         }
     }
 
     info!(
-        "Using {} threads for parallel processing of {} blobs ({} blobs/thread)",
+        "Using {} threads for parallel processing of {} blobs",
         num_threads,
-        blob_infos.len(),
-        blobs_per_thread
+        blob_infos.len()
     );
 
     // Thread positions for progress bar
-    let thread_status = Arc::new(Mutex::new(vec![ThreadStatus::default(); num_threads]));
+    let metadata = std::fs::metadata(filename).unwrap();
+    let file_size = metadata.len();
+    let thread_status: Arc<Vec<ThreadStatus>> = Arc::new(
+        (0..num_threads).map(|_| ThreadStatus::new()).collect()
+    );
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let running_clone = running.clone();
 
     // Spawn progress thread
-    let metadata = std::fs::metadata(filename).unwrap();
-    let file_size = metadata.len();
     let start_time = std::time::Instant::now();
     let thread_status_clone = thread_status.clone();
     let progress_handle = std::thread::spawn(move || {
+        let bar_width = 80 - 20;
+        let mut bar = vec![' '; bar_width];
         while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(333));  // 3 times per second
-            let thread_status = thread_status_clone.lock().unwrap();
-            print_progress_parallel(&thread_status, file_size, start_time);
+            std::thread::sleep(std::time::Duration::from_millis(200));  // 5 times per second
+            print_progress_parallel(&thread_status_clone, file_size, start_time, &mut bar);
         }
     });
 
@@ -362,13 +381,12 @@ fn process_nodes_parallel<
     // Process blob chunks in parallel - each thread gets a contiguous slice
     let (n_nodes, result) = blob_chunks
         .par_iter()
-        .enumerate()
-        .filter_map(|(thread_idx, chunk)| {
+        .filter_map(|chunk| {
             if chunk.is_empty() {
                 return None;
             }
 
-            let thread_status = thread_status.clone();
+            let thread_idx = rayon::current_thread_index().unwrap();
             let file = std::fs::File::open(&filename).unwrap();
 
             // Calculate the contiguous range for this chunk
@@ -376,21 +394,18 @@ fn process_nodes_parallel<
             let end_blob = &chunk[chunk.len() - 1];
             let total_size = (end_blob.position + end_blob.size) - start_pos;
 
-            // Set the starting position for this thread
-            {
-                let mut status = thread_status.lock().unwrap();
-                status[thread_idx].start_pos = start_pos;
-                status[thread_idx].file_pos = start_pos;
-            }
+            // Set the current chunk boundaries for this thread
+            let thread_status = thread_status.clone();
+            thread_status[thread_idx].current_chunk_start.store(start_pos, Ordering::Relaxed);
+            thread_status[thread_idx].current_chunk_pos.store(start_pos, Ordering::Relaxed);
 
             // Wrap file in InstrumentedReader to track position
+            let thread_status_clone = thread_status.clone();
             let mut instrumented = instrumented_reader::InstrumentedReader::with_frequency(
                 file,
-                10 * 1024 * 1024,  // 10 MiB -- FIXME: somehow throughput goes up when we update _more_ frequently?!
-                move |bytes_read, file_pos| {
-                    let mut status = thread_status.lock().unwrap();
-                    status[thread_idx].file_pos = file_pos;
-                    status[thread_idx].bytes_read = bytes_read;
+                40 * 1024 * 1024,
+                move |_bytes_read, file_pos| {
+                    thread_status_clone[thread_idx].current_chunk_pos.store(file_pos, Ordering::Relaxed);
                 },
             );
 
@@ -404,12 +419,18 @@ fn process_nodes_parallel<
             let mut stream = OsmStream::new(reader);
 
             // Count all nodes in this contiguous chunk
-            Some(
-                stream
-                    .nodes()
-                    .map(&map_callback)
-                    .fold((0, fold_initial.clone()), |acc, item| (acc.0 + 1, fold_callback(acc.1, item))),
-            )
+            let result = stream
+                .nodes()
+                .map(&map_callback)
+                .fold((0, fold_initial.clone()), |acc, item| (acc.0 + 1, fold_callback(acc.1, item)));
+            
+            // After completing this chunk, add its size to total completed
+            // and reset current chunk tracking to avoid double-counting
+            thread_status[thread_idx].total_bytes_completed.fetch_add(total_size, Ordering::Relaxed);
+            thread_status[thread_idx].current_chunk_start.store(0, Ordering::Relaxed);
+            thread_status[thread_idx].current_chunk_pos.store(0, Ordering::Relaxed);
+            
+            Some(result)
         })
         .reduce(|| (0, fold_initial.clone()), |acc, item| (acc.0 + item.0, merge_callback(acc.1, item.1)));
 
@@ -431,7 +452,7 @@ fn scan_blobs(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize) 
     let start_time = std::time::Instant::now();
     let instrumented = instrumented_reader::InstrumentedReader::with_frequency(
         file,
-       1024 * 1024,
+        32 * 1024,
         |bytes_read, file_pos| {
             let percentage = (file_pos as f64 / file_size as f64) * 100.0;
             print_progress(percentage, bytes_read, file_pos, start_time);
@@ -452,7 +473,7 @@ fn scan_blobs(filename: &std::path::Path, chunk_size: usize, skip_blobs: usize) 
     result
 }
 
-fn print_progress(percentage: f64, bytes_read: u64, file_pos: u64, start_time: std::time::Instant) {
+fn print_progress(percentage: f64, bytes_read: u64, _file_pos: u64, start_time: std::time::Instant) {
     let now = std::time::Instant::now();
     let throughput = bytes_read as f64 / now.duration_since(start_time).as_secs_f64();
     let throughput_mib = throughput / (1024.0 * 1024.0);
@@ -484,26 +505,35 @@ fn print_progress_parallel(
     thread_status: &[ThreadStatus],
     file_size: u64,
     start_time: std::time::Instant,
+    bar: &mut Vec<char>
 ) {
     let now = std::time::Instant::now();
     let elapsed = now.duration_since(start_time).as_secs_f64();
 
-    // Calculate average progress
-    let total_read: u64 = thread_status.iter().map(|ts| ts.bytes_read).sum();
-    let read_percentage = (total_read as f64 / file_size as f64) * 100.0;
-    let throughput_mib = (total_read as f64 / elapsed) / (1024.0 * 1024.0);
+    // Calculate total progress: completed chunks + current chunk progress for each thread
+    let total_processed: u64 = thread_status.iter().map(|ts| {
+        let completed = ts.total_bytes_completed.load(Ordering::Relaxed);
+        let chunk_start = ts.current_chunk_start.load(Ordering::Relaxed);
+        let chunk_pos = ts.current_chunk_pos.load(Ordering::Relaxed);
+        let in_progress = chunk_pos.saturating_sub(chunk_start);
+        completed + in_progress
+    }).sum();
+    
+    let read_percentage = (total_processed as f64 / file_size as f64) * 100.0;
+    let throughput_mib = (total_processed as f64 / elapsed) / (1024.0 * 1024.0);
 
     let bar_width = 80 - 20;
-    let mut bar = vec![' '; bar_width];
 
-    // Draw trails for each thread showing processed portion
+    // Draw over/onto the bar with the new thread positions and their trails from their start
     for (i, ts) in thread_status.iter().enumerate() {
-        // Calculate this thread's actual starting position in the bar
-        let start_pct = (ts.start_pos as f64 / file_size as f64);
+        // Calculate this thread's current chunk starting position in the bar
+        let chunk_start = ts.current_chunk_start.load(Ordering::Relaxed);
+        let start_pct = chunk_start as f64 / file_size as f64;
         let start_bar_pos = (start_pct * bar_width as f64) as usize;
 
-        // Calculate current position of this thread
-        let current_pct = (ts.file_pos as f64 / file_size as f64);
+        // Calculate current position of this thread within the current chunk
+        let chunk_pos = ts.current_chunk_pos.load(Ordering::Relaxed);
+        let current_pct = chunk_pos as f64 / file_size as f64;
         let current_bar_pos = (current_pct * bar_width as f64) as usize;
 
         // Draw trail from actual start position to current position

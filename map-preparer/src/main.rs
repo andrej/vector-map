@@ -183,7 +183,6 @@ fn main() -> std::io::Result<()> {
         // Determine scale: user-specified or derived to meet target max dimension.
         const TARGET_MAX: f64 = 1024.0;
         let scale_r = args.scale.unwrap_or_else(|| compute_scale_for_target_max(TARGET_MAX));
-        let ((min_x, _), (min_y, _)) = mercator_bounds(scale_r);
         let (width, height) = mercator_size(scale_r);
         let grid_width = width.ceil() as usize;
         let grid_height = height.ceil() as usize;
@@ -194,23 +193,18 @@ fn main() -> std::io::Result<()> {
         );
         println!("Generating {}x{} density grid (scale {:.4})...", grid_width, grid_height, scale_r);
 
-        // Precompute latitude -> y-bin lookup to avoid per-node trig/log; and degree-based x scaling.
+        // Precompute latitude -> y-bin lookup to avoid per-node trig/log
         let lat_samples_per_degree = compute_lat_samples_per_degree(scale_r).max(1);
-        let lat_lut = build_lat_to_ybin_lut(scale_r, min_y, grid_height, lat_samples_per_degree);
-        let lat_index_offset = (90 * lat_samples_per_degree) as isize; // shift [-90,90] to [0, 180*samples]
-        let lon_scale_per_degree = scale_r * std::f64::consts::PI / 180.0; // R * pi / 180
-        let x_offset = -min_x; // equals πR; rel_x = x - min_x = R*λ + πR
+        let lat_lut = build_lat_to_ybin_lut(scale_r, lat_samples_per_degree);
 
         // Closure maps a node's lat/lon into grid indices using lookup and simple scaling.
         let map_fn = move |node: OsmNode| {
             latlon_to_web_mercator_bins(
                 node.lat,
                 node.lon,
-                lon_scale_per_degree,
-                x_offset,
+                scale_r,
                 grid_width,
                 lat_samples_per_degree,
-                lat_index_offset,
                 &lat_lut,
             )
         };
@@ -606,21 +600,29 @@ fn compute_lat_samples_per_degree(r: f64) -> usize {
 }
 
 /// Build a lookup table mapping latitude (indexed by scaled degrees) to y-bin index.
-/// Table index i corresponds to lat_deg = i / samples_per_degree - 90.
+/// Table index i corresponds to lat_deg = i / samples_per_degree - MAX_MERCATOR_LAT.
+/// Y-axis increases downward (0 at top, grid_height-1 at bottom).
+/// Only covers the valid Mercator range [-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT].
 fn build_lat_to_ybin_lut(
     r: f64,
-    min_y: f64,
-    grid_height: usize,
     samples_per_degree: usize,
 ) -> Vec<usize> {
-    let total_indices = 180 * samples_per_degree + 1; // include endpoint
+    let lat_range = 2.0 * MAX_MERCATOR_LAT;
+    let total_indices = (lat_range * samples_per_degree as f64).ceil() as usize + 1;
+    
+    // Calculate grid dimensions from scale
+    let max_lat_rad = MAX_MERCATOR_LAT.to_radians();
+    let max_y = r * ((std::f64::consts::PI / 4.0 + max_lat_rad / 2.0).tan().ln());
+    let grid_height = (2.0 * max_y).ceil() as usize;
+    
     let mut lut = Vec::with_capacity(total_indices);
     for i in 0..total_indices {
-        let lat_deg = (i as f64) / (samples_per_degree as f64) - 90.0;
-        let lat_clamped = lat_deg.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
-        let lat_rad = lat_clamped.to_radians();
-        let y = r * ((std::f64::consts::PI / 4.0 + lat_rad / 2.0).tan().ln());  // Mercator projection y for lat_rad
-        let rel_y = y - min_y;
+        let lat_deg = (i as f64) / (samples_per_degree as f64) - MAX_MERCATOR_LAT;
+        let lat_rad = lat_deg.to_radians();
+        let y = r * ((std::f64::consts::PI / 4.0 + lat_rad / 2.0).tan().ln());
+        
+        // Flip Y axis: max_y (north) -> 0, -max_y (south) -> grid_height-1
+        let rel_y = max_y - y;
         let mut y_bin = rel_y.trunc() as isize;
         y_bin = y_bin.clamp(0, (grid_height - 1) as isize);
         lut.push(y_bin as usize);
@@ -630,26 +632,31 @@ fn build_lat_to_ybin_lut(
 
 /// Fast mapping from latitude/longitude (degrees) to grid bins using precomputed LUT for latitude
 /// and linear degree-based scaling for longitude.
+/// Clamps input coordinates to valid Mercator range.
 fn latlon_to_web_mercator_bins(
     lat_deg: f64,
     lon_deg: f64,
-    lon_scale_per_degree: f64,
-    x_offset: f64,
+    r: f64,
     grid_width: usize,
     lat_samples_per_degree: usize,
-    lat_index_offset: isize,
     lat_lut: &[usize],
 ) -> (usize, usize) {
-    // X bin: rel_x = (R * π / 180) * lon_deg + πR; index = floor(rel_x)
-    let mut x_bin = (lon_scale_per_degree * lon_deg + x_offset).trunc() as isize;
+    // Clamp to valid Mercator range
+    let lat_clamped = lat_deg.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
+    let lon_clamped = lon_deg.clamp(-180.0, 180.0);
+    
+    // X bin: x = R*λ, rel_x = x + πR, bin = floor(rel_x)
+    // Compute directly: lon_scale_per_degree = R * π / 180, x_offset = πR
+    let lon_scale_per_degree = r * std::f64::consts::PI / 180.0;
+    let x_offset = std::f64::consts::PI * r;
+    let mut x_bin = (lon_scale_per_degree * lon_clamped + x_offset).trunc() as isize;
     x_bin = x_bin.clamp(0, (grid_width - 1) as isize);
 
-    // Y bin from LUT: index by scaled degrees with offset
-    let mut idx = ((lat_deg * lat_samples_per_degree as f64).trunc() as isize) + lat_index_offset;
-    // Clamp to table range
-    if idx < 0 { idx = 0; }
-    if idx as usize >= lat_lut.len() { idx = (lat_lut.len() - 1) as isize; }
-    let y_bin = lat_lut[idx as usize];
+    // Y bin from LUT: index by scaled degrees with offset from -MAX_MERCATOR_LAT
+    let idx = ((lat_clamped + MAX_MERCATOR_LAT) * lat_samples_per_degree as f64).trunc() as usize;
+    // Clamp to table range (should not be necessary after input clamping, but be safe)
+    let idx_clamped = idx.min(lat_lut.len() - 1);
+    let y_bin = lat_lut[idx_clamped];
 
     (x_bin as usize, y_bin)
 }

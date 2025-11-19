@@ -529,7 +529,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                         }
                         ReadingBlobDataState::DecodingPrimitiveGroup {
                             state: ref mut decoding_primitive_group_state,
-                            heap,
+                            heap: _,
                             ref mut remaining_groups,
                             remaining_slice: _,
                             string_table: _,
@@ -1128,7 +1128,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         enum KvState {
             Key,
             Value,
-        };
+        }
         let mut kv_state = KvState::Key;
         loop {
             let mut key_or_val_idx: u64 = 0;

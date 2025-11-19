@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use std::io::{Read, Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, trace};
 use tracing_subscriber::FmtSubscriber;
 
 const CHUNK_SIZE: usize = 8192;
@@ -33,7 +33,7 @@ struct ClArgs {
     blob_scan_chunk_size: usize,
 
     /// Buffer chunk size in bytes
-    #[arg(short = 'c', long = "chunk-size", default_value_t = 524288)]
+    #[arg(short = 'c', long = "chunk-size", default_value_t = 1_048_576)]
     chunk_size: usize,
 
     /// Skip the first N blobs.
@@ -57,7 +57,7 @@ struct ClArgs {
     output: Option<std::path::PathBuf>,
 
     /// Number of parallel threads for entity processing (0 = sequential)
-    #[arg(short = 'j', long = "threads", default_value_t = 10)]
+    #[arg(short = 'j', long = "threads", default_value_t = 8)]
     threads: usize,
 
     /// Number of chunks per thread for load balancing
@@ -196,21 +196,24 @@ fn main() -> std::io::Result<()> {
         // Precompute latitude -> y-bin lookup to avoid per-node trig/log
         let lat_samples_per_degree = compute_lat_samples_per_degree(scale_r).max(1);
         let lat_lut = build_lat_to_ybin_lut(scale_r, lat_samples_per_degree);
+        trace!("Latitude to Y-bin LUT: samples_per_degree {}, entries {}", lat_samples_per_degree, lat_lut.len());
+        let lon_scale_per_degree = grid_width as f64 / 360.0;
 
         // Closure maps a node's lat/lon into grid indices using lookup and simple scaling.
         let map_fn = move |node: OsmNode| {
             latlon_to_web_mercator_bins(
                 node.lat,
                 node.lon,
-                scale_r,
-                grid_width,
+                lon_scale_per_degree,
                 lat_samples_per_degree,
                 &lat_lut,
             )
         };
 
-        let fold_fn = |mut grid: Box<DynamicGrid>, (x, y): (usize, usize)| {
-            grid.inc(x, y);
+        let fold_fn = |mut grid: Box<DynamicGrid>, maybe_coords: Option<(usize, usize)>| {
+            if let Some((x, y)) = maybe_coords {
+                grid.inc(x, y);
+            }
             grid
         };
 
@@ -397,7 +400,7 @@ fn process_nodes_parallel<
             let thread_status_clone = thread_status.clone();
             let mut instrumented = instrumented_reader::InstrumentedReader::with_frequency(
                 file,
-                40 * 1024 * 1024,
+                10 * 1024 * 1024,  // FIXME: For some reason, updating more frequently seems to speed things up?! Not sure why.
                 move |_bytes_read, file_pos| {
                     thread_status_clone[thread_idx].current_chunk_pos.store(file_pos, Ordering::Relaxed);
                 },
@@ -589,12 +592,16 @@ fn compute_scale_for_target_max(target_max: f64) -> f64 {
     target_max / (2.0 * std::f64::consts::PI)
 }
 
-/// Compute minimum samples-per-degree for latitude lookup to ensure each table step
-/// moves at most one y-bin across the entire latitude range (worst case at MAX_MERCATOR_LAT).
+/// Compute minimum samples-per-degree for latitude lookup to ensure each table step moves at most one y-bin (== pixel == projected whole integer value) across the entire latitude range (worst case at MAX_MERCATOR_LAT).
+/// The Mercator projection stretches y values near the poles, so more samples are needed there
+/// (smaller change in latitude corresponds to a larger change in y).
+/// Mercator latitude projection formula:
+///  y = R * ln(tan(pi/4 + lat/2))
 fn compute_lat_samples_per_degree(r: f64) -> usize {
     let sec_max = 1.0 / MAX_MERCATOR_LAT.to_radians().cos();
-    // dy/ddeg = R * 0.5 * sec(lat) * (π/180)
-    let dy_per_degree_max = r * 0.5 * sec_max * (std::f64::consts::PI / 180.0);
+    // Derivative of y w.r.t. latitude (degrees):
+    // dy/dlat = R * sec(lat) * (π/180)
+    let dy_per_degree_max = r * sec_max * (std::f64::consts::PI / 180.0);
     // Require dy per table step <= 1 bin => steps_per_degree >= dy_per_degree_max
     dy_per_degree_max.ceil() as usize
 }
@@ -636,29 +643,22 @@ fn build_lat_to_ybin_lut(
 fn latlon_to_web_mercator_bins(
     lat_deg: f64,
     lon_deg: f64,
-    r: f64,
-    grid_width: usize,
+    lon_scale_per_degree: f64,
     lat_samples_per_degree: usize,
     lat_lut: &[usize],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     // Clamp to valid Mercator range
-    let lat_clamped = lat_deg.clamp(-MAX_MERCATOR_LAT, MAX_MERCATOR_LAT);
-    let lon_clamped = lon_deg.clamp(-180.0, 180.0);
-    
-    // X bin: x = R*λ, rel_x = x + πR, bin = floor(rel_x)
-    // Compute directly: lon_scale_per_degree = R * π / 180, x_offset = πR
-    let lon_scale_per_degree = r * std::f64::consts::PI / 180.0;
-    let x_offset = std::f64::consts::PI * r;
-    let mut x_bin = (lon_scale_per_degree * lon_clamped + x_offset).trunc() as isize;
-    x_bin = x_bin.clamp(0, (grid_width - 1) as isize);
+    if lat_deg.abs() > MAX_MERCATOR_LAT {
+        return None
+    }
 
-    // Y bin from LUT: index by scaled degrees with offset from -MAX_MERCATOR_LAT
-    let idx = ((lat_clamped + MAX_MERCATOR_LAT) * lat_samples_per_degree as f64).trunc() as usize;
-    // Clamp to table range (should not be necessary after input clamping, but be safe)
-    let idx_clamped = idx.min(lat_lut.len() - 1);
-    let y_bin = lat_lut[idx_clamped];
+    let lon_wrapped = (lon_deg + 180.0) % 360.0;
+    let x_bin = (lon_wrapped * lon_scale_per_degree) as usize;
 
-    (x_bin as usize, y_bin)
+    let y_lut_idx = ((lat_deg + MAX_MERCATOR_LAT) * lat_samples_per_degree as f64) as usize;
+    let y_bin = lat_lut[y_lut_idx];
+
+    Some((x_bin as usize, y_bin))
 }
 
 /// Save a dynamic density grid to a binary file

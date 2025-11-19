@@ -2,6 +2,125 @@ use clap::Parser;
 use plotters::prelude::*;
 use std::path::PathBuf;
 
+/// Available colormaps for heatmap visualization
+#[derive(Debug, Clone, Copy)]
+enum Colormap {
+    Jet,       // Blue -> Cyan -> Green -> Yellow -> Red
+    Viridis,   // Purple -> Blue -> Green -> Yellow
+    Turbo,     // Blue -> Cyan -> Green -> Yellow -> Orange -> Red
+}
+
+impl Colormap {
+    /// Map a normalized value [0.0, 1.0] to an RGB color
+    fn map(&self, value: f64) -> (u8, u8, u8) {
+        let v = value.clamp(0.0, 1.0);
+        
+        match self {
+            Colormap::Jet => jet_colormap(v),
+            Colormap::Viridis => viridis_colormap(v),
+            Colormap::Turbo => turbo_colormap(v),
+        }
+    }
+}
+
+/// Jet colormap: Blue -> Cyan -> Green -> Yellow -> Red
+fn jet_colormap(v: f64) -> (u8, u8, u8) {
+    let r = if v < 0.375 {
+        0.0
+    } else if v < 0.625 {
+        (v - 0.375) / 0.25
+    } else if v < 0.875 {
+        1.0
+    } else {
+        1.0 - (v - 0.875) / 0.125 * 0.5
+    };
+    
+    let g = if v < 0.125 {
+        0.0
+    } else if v < 0.375 {
+        (v - 0.125) / 0.25
+    } else if v < 0.625 {
+        1.0
+    } else if v < 0.875 {
+        1.0 - (v - 0.625) / 0.25
+    } else {
+        0.0
+    };
+    
+    let b = if v < 0.125 {
+        0.5 + v / 0.125 * 0.5
+    } else if v < 0.375 {
+        1.0
+    } else if v < 0.625 {
+        1.0 - (v - 0.375) / 0.25
+    } else {
+        0.0
+    };
+    
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// Viridis colormap: perceptually uniform, colorblind-friendly
+fn viridis_colormap(v: f64) -> (u8, u8, u8) {
+    // Simplified 5-point interpolation based on viridis control points
+    let points = [
+        (0.267004, 0.004874, 0.329415), // Dark purple
+        (0.282623, 0.140926, 0.457517), // Purple-blue
+        (0.163625, 0.471133, 0.558148), // Blue-green
+        (0.477504, 0.821444, 0.318195), // Yellow-green
+        (0.993248, 0.906157, 0.143936), // Yellow
+    ];
+    
+    let idx = v * (points.len() - 1) as f64;
+    let i = idx.floor() as usize;
+    let t = idx - i as f64;
+    
+    if i >= points.len() - 1 {
+        let p = points[points.len() - 1];
+        return ((p.0 * 255.0) as u8, (p.1 * 255.0) as u8, (p.2 * 255.0) as u8);
+    }
+    
+    let (r0, g0, b0) = points[i];
+    let (r1, g1, b1) = points[i + 1];
+    
+    let r = r0 + t * (r1 - r0);
+    let g = g0 + t * (g1 - g0);
+    let b = b0 + t * (b1 - b0);
+    
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+/// Turbo colormap: improved rainbow, more perceptually uniform than jet
+fn turbo_colormap(v: f64) -> (u8, u8, u8) {
+    // Simplified 6-point turbo approximation
+    let points = [
+        (0.18995, 0.07176, 0.23217), // Dark blue
+        (0.11770, 0.56700, 0.75088), // Cyan
+        (0.17205, 0.88797, 0.54362), // Green
+        (0.89567, 0.99343, 0.29685), // Yellow
+        (0.97809, 0.55414, 0.10540), // Orange
+        (0.78801, 0.08080, 0.06051), // Red
+    ];
+    
+    let idx = v * (points.len() - 1) as f64;
+    let i = idx.floor() as usize;
+    let t = idx - i as f64;
+    
+    if i >= points.len() - 1 {
+        let p = points[points.len() - 1];
+        return ((p.0 * 255.0) as u8, (p.1 * 255.0) as u8, (p.2 * 255.0) as u8);
+    }
+    
+    let (r0, g0, b0) = points[i];
+    let (r1, g1, b1) = points[i + 1];
+    
+    let r = r0 + t * (r1 - r0);
+    let g = g0 + t * (g1 - g0);
+    let b = b0 + t * (b1 - b0);
+    
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
 /// Dynamic grid storing counts in row-major order.
 #[derive(Debug)]
 struct DynamicGrid {
@@ -20,13 +139,9 @@ struct ClArgs {
     #[arg(short = 'o', long = "output")]
     output: PathBuf,
 
-    /// Minimum color (hex format, e.g., 0000ff for blue)
-    #[arg(long, default_value = "0000ff")]
-    min_color: String,
-
-    /// Maximum color (hex format, e.g., ffff00 for yellow)
-    #[arg(long, default_value = "ffff00")]
-    max_color: String,
+    /// Color scheme to use (jet, viridis, turbo)
+    #[arg(long, default_value = "jet")]
+    colormap: String,
 
     /// Verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -40,11 +155,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grid = load_grid_from_file(&args.input_grid)?;
     println!("Loaded grid: {}x{} cells", grid.width, grid.height);
 
-    println!("Generating heatmap...");
-    let min_color = parse_hex_color(&args.min_color)?;
-    let max_color = parse_hex_color(&args.max_color)?;
+    println!("Generating heatmap with {} colormap...", args.colormap);
+    let colormap = match args.colormap.to_lowercase().as_str() {
+        "jet" => Colormap::Jet,
+        "viridis" => Colormap::Viridis,
+        "turbo" => Colormap::Turbo,
+        _ => {
+            eprintln!("Unknown colormap '{}', using 'jet'", args.colormap);
+            Colormap::Jet
+        }
+    };
     
-    save_heatmap_to_png(&grid, &args.output, min_color, max_color)?;
+    save_heatmap_to_png(&grid, &args.output, colormap)?;
     
     println!("Heatmap saved to: {}", args.output.display());
     Ok(())
@@ -78,26 +200,11 @@ fn load_grid_from_file(
     Ok(DynamicGrid { width, height, data })
 }
 
-/// Parse a hex color string (e.g., "ff0000" for red) into RGB values
-fn parse_hex_color(hex: &str) -> Result<(u8, u8, u8), Box<dyn std::error::Error>> {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() != 6 {
-        return Err(format!("Invalid color format: {}, expected 6 hex digits", hex).into());
-    }
-    
-    let r = u8::from_str_radix(&hex[0..2], 16)?;
-    let g = u8::from_str_radix(&hex[2..4], 16)?;
-    let b = u8::from_str_radix(&hex[4..6], 16)?;
-    
-    Ok((r, g, b))
-}
-
 /// Paint a heatmap from a 2D grid of counts and save to PNG
 fn save_heatmap_to_png(
     grid: &DynamicGrid,
     output_path: &std::path::Path,
-    min_color: (u8, u8, u8),
-    max_color: (u8, u8, u8),
+    colormap: Colormap,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Find max value for normalization
     let max_value = grid
@@ -128,10 +235,8 @@ fn save_heatmap_to_png(
                     0.0
                 };
 
-                // Interpolate between min_color and max_color
-                let r = (min_color.0 as f64 + intensity * (max_color.0 as f64 - min_color.0 as f64)) as u8;
-                let g = (min_color.1 as f64 + intensity * (max_color.1 as f64 - min_color.1 as f64)) as u8;
-                let b = (min_color.2 as f64 + intensity * (max_color.2 as f64 - min_color.2 as f64)) as u8;
+                // Map intensity to color using the selected colormap
+                let (r, g, b) = colormap.map(intensity);
 
                 let color = RGBColor(r, g, b);
                 root.draw_pixel((x as i32, y as i32), &color)?;

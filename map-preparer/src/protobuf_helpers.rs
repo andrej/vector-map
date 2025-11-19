@@ -147,6 +147,15 @@ pub fn decode_varint<R: BufRead>(
     }
 }
 
+/// Apply zigzag decoding to an already-read varint value.
+/// This is useful when you have a u64 varint value from decode_field that needs zigzag decoding.
+#[inline]
+pub fn zigzag_decode(raw: u64) -> i64 {
+    // Optimized zigzag decoding: (n >> 1) ^ -(n & 1)
+    // Equivalent to: if n & 1 == 0 { n >> 1 } else { !((n >> 1)) }
+    ((raw >> 1) ^ (raw & 1).wrapping_neg()) as i64
+}
+
 /// Decode a zigzag-encoded varint from the stream into `out`.
 /// zigzag-encoded varints are used for sint32 and sint64 types.
 #[inline]
@@ -164,9 +173,7 @@ pub fn decode_zigzag_varint<R: BufRead>(
             ))
         }
     };
-    // Optimized zigzag decoding: (n >> 1) ^ -(n & 1)
-    // Equivalent to: if n & 1 == 0 { n >> 1 } else { !((n >> 1)) }
-    *out = ((raw >> 1) ^ (raw & 1).wrapping_neg()) as i64;
+    *out = zigzag_decode(raw);
     Ok(n_bytes)
 }
 

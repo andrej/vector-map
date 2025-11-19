@@ -1,6 +1,6 @@
 use crate::osm_pbf;
 use crate::partially_compressed::PartiallyCompressedStream;
-use crate::protobuf_helpers::{decode_field, decode_varint, decode_zigzag_varint, WireType};
+use crate::protobuf_helpers::{decode_field, decode_varint, decode_zigzag_varint, zigzag_decode, WireType};
 use bytes::{Buf, Bytes, BytesMut};
 use prost::Message;
 use std::collections::VecDeque;
@@ -82,10 +82,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
     /// This is useful for parallel processing of blobs.
     pub fn blobs<'a>(&'a mut self) -> BlobIterator<'a, R> {
         BlobIterator::new(self)
-    }
-
-    pub fn raw_nodes<'a>(&'a mut self) -> RawNodeIterator<'a, R> {
-        RawNodeIterator::new(self)
     }
 
     pub fn nodes<'a>(&'a mut self) -> NodeIterator<'a, R> {
@@ -179,51 +175,6 @@ impl<'a, R: Read + BufRead + Seek> Iterator for BlobIterator<'a, R> {
     }
 }
 
-pub struct RawNodeIterator<'a, R: Read + BufRead + Seek> {
-    stream: &'a mut OsmStream<R>,
-}
-
-impl<'a, R: Read + BufRead + Seek> RawNodeIterator<'a, R> {
-    pub fn new(stream: &'a mut OsmStream<R>) -> Self {
-        Self { stream }
-    }
-}
-
-impl<'a, R: Read + BufRead + Seek> Iterator for RawNodeIterator<'a, R> {
-    type Item = RawOsmNode;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            self.stream.decode_next().unwrap();
-            match &self.stream.state {
-                OsmStreamState::ReadingBlob {
-                    state:
-                        ReadingBlobState::ReadingBlobData(
-                            ReadingBlobDataState::DecodingPrimitiveGroup {
-                                state:
-                                    DecodingPrimitiveGroupState::DecodingDenseNodes {
-                                        state: DecodingDenseNodesState::Decoding { node, .. },
-                                        ..
-                                    },
-                                ..
-                            },
-                        ),
-                    ..
-                } => {
-                    return Some(node.clone());
-                }
-                OsmStreamState::End => {
-                    return None;
-                }
-                _ => {
-                    // Continue until state is one of the above two.
-                    continue;
-                }
-            }
-        }
-    }
-}
-
 pub struct NodeIterator<'a, R: Read + BufRead + Seek> {
     stream: &'a mut OsmStream<R>,
 }
@@ -246,8 +197,12 @@ impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
                         ReadingBlobState::ReadingBlobData(
                             ReadingBlobDataState::DecodingPrimitiveGroup {
                                 state:
-                                    DecodingPrimitiveGroupState::DecodingDenseNodes {
-                                        state: DecodingDenseNodesState::Decoding { node, .. },
+                                    DecodingPrimitiveGroupState::DecodingNodes {
+                                        state: DecodingNodesState::Decoded { node, .. },
+                                        ..
+                                    } 
+                                    | DecodingPrimitiveGroupState::DecodingDenseNodes {
+                                        state: DecodingDenseNodesState::Decoded { node, .. },
                                         ..
                                     },
                                 info,
@@ -312,11 +267,17 @@ impl<'a, R: Read + BufRead + Seek> Iterator for NodeIterator<'a, R> {
 ///    │                    │                                                              │   │
 ///    │                    └─→ DecodingPrimitiveGroupState::Start ←───────────────────┐   │   │
 ///    │                           │                                                   │   │   │
+///    │                           ├─→ DecodingPrimitiveGroupState::DecodingNodes      │   │   │
+///    │                           │      │                                            │   │   │
+///    │                           │      └─→ DecodingNodesState::Decoded   ←─┐        │   │   │
+///    │                           │             │    │ (yields entities)     │        │   │   │
+///    │                           │             │    └───────────────────────┘        │   │   │
+///    │                           │             ↓                                     │   │   │
+///    │                           │          DecodingNodesState::End ─────────────────┤   │   │
+///    │                           │                                                   │   │   │
 ///    │                           ├─→ DecodingPrimitiveGroupState::DecodingDenseNodes │   │   │
 ///    │                           │      │                                            │   │   │
-///    │                           │      └─→ DecodingDenseNodesState::Start           │   │   │
-///    │                           │             ↓ (always)                            │   │   │
-///    │                           │          DecodingDenseNodesState::Decoding  ←─┐   │   │   │
+///    │                           │      └─→ DecodingDenseNodesState::Decoded   ←─┐   │   │   │
 ///    │                           │             │    │ (yields entities)          │   │   │   │
 ///    │                           │             │    └────────────────────────────┘   │   │   │
 ///    │                           │             ↓                                     │   │   │
@@ -363,7 +324,6 @@ enum ReadingBlobDataState {
     Start,
     DecodingPrimitiveGroup {
         state: DecodingPrimitiveGroupState,
-        heap: Bytes,
         remaining_groups: VecDeque<Bytes>, // remaining groups on the heap to decode (subslices of heap)
         remaining_slice: Bytes, // remaining subslice of the current group's bytes on the heap to decode (subslices of heap)
         string_table: Vec<Bytes>, // subslices of heap
@@ -375,6 +335,10 @@ enum ReadingBlobDataState {
 #[derive(Debug)]
 enum DecodingPrimitiveGroupState {
     Start,
+    DecodingNodes {
+        slice: Bytes, // subslice of heap being decoded
+        state: DecodingNodesState,
+    },
     DecodingDenseNodes {
         slice: Bytes, // subslice of heap being decoded
         state: DecodingDenseNodesState,
@@ -391,9 +355,16 @@ struct PrimitiveGroupInfo {
 }
 
 #[derive(Debug)]
+enum DecodingNodesState {
+    Decoded {
+        node: RawOsmNode,
+    },
+    End,
+}
+
+#[derive(Debug)]
 enum DecodingDenseNodesState {
-    Start,
-    Decoding {
+    Decoded {
         ids_slice: Bytes,
         lats_slice: Bytes,
         lons_slice: Bytes,
@@ -436,7 +407,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                         }
                         ReadingBlobDataState::DecodingPrimitiveGroup {
                             state: decoding_primitive_group_state,
-                            heap: _,
                             remaining_groups,
                             remaining_slice,
                             string_table,
@@ -447,17 +417,30 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                                     Self::decode_primitive_group_start(
                                         remaining_slice,
                                         remaining_groups,
+                                        string_table
                                     )?;
                             }
-                            DecodingPrimitiveGroupState::DecodingDenseNodes {
+                            DecodingPrimitiveGroupState::DecodingNodes {
                                 slice,
+                                state: decoding_nodes_state,
+                            } => match decoding_nodes_state {
+                                DecodingNodesState::Decoded { .. } => {
+                                    Self::decode_nodes_single(
+                                        slice, 
+                                        decoding_nodes_state,
+                                        string_table,
+                                    )?;
+                                }
+                                DecodingNodesState::End => {
+                                    *decoding_primitive_group_state =
+                                        DecodingPrimitiveGroupState::Start;
+                                }
+                            },
+                            DecodingPrimitiveGroupState::DecodingDenseNodes {
+                                slice: _,
                                 state: decoding_dense_nodes_state,
                             } => match decoding_dense_nodes_state {
-                                DecodingDenseNodesState::Start => {
-                                    *decoding_dense_nodes_state =
-                                        Self::decode_dense_nodes_start(slice)?
-                                }
-                                DecodingDenseNodesState::Decoding { .. } => {
+                                DecodingDenseNodesState::Decoded { .. } => {
                                     Self::decode_dense_nodes_single(
                                         decoding_dense_nodes_state,
                                         string_table,
@@ -529,7 +512,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                         }
                         ReadingBlobDataState::DecodingPrimitiveGroup {
                             state: ref mut decoding_primitive_group_state,
-                            heap: _,
                             ref mut remaining_groups,
                             remaining_slice: _,
                             string_table: _,
@@ -543,6 +525,12 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                                     return Ok(());
                                 };
                                 Ok(())
+                            }
+                            DecodingPrimitiveGroupState::DecodingNodes { .. } => {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Skipping nodes not implemented",
+                                ))
                             }
                             DecodingPrimitiveGroupState::DecodingDenseNodes { .. } => {
                                 Err(std::io::Error::new(
@@ -915,7 +903,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
 
         Ok(ReadingBlobDataState::DecodingPrimitiveGroup {
             state: DecodingPrimitiveGroupState::Start,
-            heap: heap,
             remaining_groups: groups,
             remaining_slice: remaining_slice,
             string_table: string_table,
@@ -931,6 +918,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
     fn decode_primitive_group_start(
         remaining_slice: &mut Bytes,
         remaining_groups: &mut VecDeque<Bytes>,
+        string_table: &Vec<Bytes>,
     ) -> Result<DecodingPrimitiveGroupState, std::io::Error> {
         let _span = span!(Level::TRACE, "decode_primitive_group").entered();
         /*
@@ -969,24 +957,32 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                 "EOF while reading PrimitiveGroup field",
             ));
         };
+        remaining_slice.advance(n_read);
+
         // Subslice to process in child states
         let subslice = remaining_slice.slice(n_read..);
 
-        // Advance remaining slice
-        remaining_slice.advance(
-            n_read
-                + match wire_type {
-                    WireType::LengthDelimited(len) => len as usize,
-                    _ => 0,
-                },
-        );
-
-        match (field_number, &wire_type) {
-            (2, WireType::LengthDelimited(_)) => {
+        let next_state = match (field_number, &wire_type) {
+            (1, WireType::LengthDelimited(len)) => {
+                // Nodes
+                let mut subslice = remaining_slice.slice(0..*len as usize);
+                let mut new_substate = DecodingNodesState::Decoded {
+                    node: RawOsmNode::default(),
+                };
+                Self::decode_nodes_single(&mut subslice, &mut new_substate, &Vec::new())?;
+                Ok(DecodingPrimitiveGroupState::DecodingNodes {
+                    slice: subslice,
+                    state: new_substate
+                })
+            }
+            (2, WireType::LengthDelimited(len)) => {
+                let mut subslice = remaining_slice.slice(0..*len as usize);
+                let mut new_substate = Self::decode_dense_nodes_start(&subslice)?;
+                Self::decode_dense_nodes_single(&mut new_substate, &string_table)?;
                 // Dense nodes
                 Ok(DecodingPrimitiveGroupState::DecodingDenseNodes {
                     slice: subslice,
-                    state: DecodingDenseNodesState::Start,
+                    state: new_substate,
                 })
             }
             (3, WireType::LengthDelimited(_)) => {
@@ -996,11 +992,6 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             }
             (4, WireType::LengthDelimited(_)) => {
                 // Relations
-                // Not yet implemented, skip
-                Ok(DecodingPrimitiveGroupState::Start)
-            }
-            (1, WireType::LengthDelimited(_)) => {
-                // Nodes
                 // Not yet implemented, skip
                 Ok(DecodingPrimitiveGroupState::Start)
             }
@@ -1016,7 +1007,144 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
                     field_number, wire_type
                 ),
             )),
+        };
+
+        // Advance remaining slice for next field in PrimitiveGroup
+        if let WireType::LengthDelimited(len) = wire_type {
+            remaining_slice.advance(len as usize);
         }
+
+        return next_state
+    }
+
+    fn decode_nodes_single(
+        remaining_slice: &mut Bytes,
+        state: &mut DecodingNodesState,
+        string_table: &Vec<Bytes>,
+    ) -> Result<(), std::io::Error> {
+        let _span = span!(Level::TRACE, "decode_nodes_single").entered();
+
+        let DecodingNodesState::Decoded {
+            node,
+        } = state
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid state for decoding nodes single",
+            ));
+        };
+
+        if remaining_slice.is_empty() {
+            *state = DecodingNodesState::End;
+            return Ok(());
+        }
+
+        /*
+            message Node {
+              required sint64 id = 1;
+              // Parallel arrays.
+              repeated uint32 keys = 2 [packed = true]; // String IDs.
+              repeated uint32 vals = 3 [packed = true]; // String IDs.
+              optional Info info = 4; // May be omitted in omitmeta
+              required sint64 lat = 8;
+              required sint64 lon = 9;
+            }
+        */
+
+        // Clear previous node data
+        node.kv.clear();
+        node.id = 0;
+        node.lat = 0;
+        node.lon = 0;
+
+        let mut keys_slice: Option<Bytes> = None;
+        let mut vals_slice: Option<Bytes> = None;
+
+        let mut field_number: u32 = 0;
+        let mut wire_type = WireType::Varint(0);
+        let slice_reader = &mut (&remaining_slice as &[u8]);
+        
+        while let Some(_n_read) = decode_field(slice_reader, &mut field_number, &mut wire_type)? {
+            match (field_number, &wire_type) {
+                (1, WireType::Varint(val)) => {
+                    // id (sint64, zigzag encoded)
+                    node.id = zigzag_decode(*val) as u64;
+                }
+                (2, WireType::LengthDelimited(len)) => {
+                    // keys (packed uint32)
+                    let start = slice_reader.as_ptr() as usize - remaining_slice.as_ptr() as usize;
+                    keys_slice = Some(remaining_slice.slice(start..start + (*len as usize)));
+                    *slice_reader = &slice_reader[*len as usize..];
+                }
+                (3, WireType::LengthDelimited(len)) => {
+                    // vals (packed uint32)
+                    let start = slice_reader.as_ptr() as usize - remaining_slice.as_ptr() as usize;
+                    vals_slice = Some(remaining_slice.slice(start..start + (*len as usize)));
+                    *slice_reader = &slice_reader[*len as usize..];
+                }
+                (4, WireType::LengthDelimited(len)) => {
+                    // info (optional, skip for now)
+                    *slice_reader = &slice_reader[*len as usize..];
+                }
+                (8, WireType::Varint(val)) => {
+                    // lat (sint64, zigzag encoded)
+                    node.lat = zigzag_decode(*val);
+                }
+                (9, WireType::Varint(val)) => {
+                    // lon (sint64, zigzag encoded)
+                    node.lon = zigzag_decode(*val);
+                }
+                _ => {
+                    // Skip unknown fields
+                    match &wire_type {
+                        WireType::LengthDelimited(len) => {
+                            *slice_reader = &slice_reader[*len as usize..];
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Decode key/value pairs if present
+        if let (Some(mut keys), Some(mut vals)) = (keys_slice, vals_slice) {
+            loop {
+                let mut key_idx: u64 = 0;
+                let Some(n_read) = decode_varint(&mut &keys[..], &mut key_idx)? else {
+                    break;
+                };
+                keys.advance(n_read);
+
+                let mut val_idx: u64 = 0;
+                let Some(n_read) = decode_varint(&mut &vals[..], &mut val_idx)? else {
+                    break;
+                };
+                vals.advance(n_read);
+
+                let Some(key_bytes) = string_table.get(key_idx as usize) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Key index out of bounds: {}", key_idx),
+                    ));
+                };
+                let Some(val_bytes) = string_table.get(val_idx as usize) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Value index out of bounds: {}", val_idx),
+                    ));
+                };
+
+                node.kv.push((key_bytes.clone(), val_bytes.clone()));
+            }
+        }
+
+        // Advance remaining_slice to consume the bytes we just read
+        let bytes_consumed = remaining_slice.len() - slice_reader.len();
+        remaining_slice.advance(bytes_consumed);
+
+        trace!("Decoded Node: {:?}", node);
+
+        Ok(())
     }
 
     fn decode_dense_nodes_start(slice: &Bytes) -> Result<DecodingDenseNodesState, std::io::Error> {
@@ -1084,7 +1212,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
             ));
         };
 
-        Ok(DecodingDenseNodesState::Decoding {
+        Ok(DecodingDenseNodesState::Decoded {
             ids_slice,
             lats_slice,
             lons_slice,
@@ -1099,7 +1227,7 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
     ) -> Result<(), std::io::Error> {
         let _span = span!(Level::TRACE, "decode_dense_nodes_single").entered();
 
-        let DecodingDenseNodesState::Decoding {
+        let DecodingDenseNodesState::Decoded {
             ids_slice,
             lats_slice,
             lons_slice,
@@ -1177,10 +1305,4 @@ impl<R: Read + BufRead + Seek> OsmStream<R> {
         Ok(decoded_value)
     }
 
-    fn decode_entity(&mut self) -> Result<Option<RawOsmEntity>, std::io::Error> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Not implemented yet",
-        ))
-    }
 }

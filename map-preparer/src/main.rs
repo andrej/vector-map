@@ -33,7 +33,7 @@ struct ClArgs {
     blob_scan_chunk_size: usize,
 
     /// Buffer chunk size in bytes
-    #[arg(short = 'c', long = "chunk-size", default_value_t = 1_048_576)]
+    #[arg(short = 'c', long = "chunk-size", default_value_t = 262_144)]
     chunk_size: usize,
 
     /// Skip the first N blobs.
@@ -57,11 +57,11 @@ struct ClArgs {
     output: Option<std::path::PathBuf>,
 
     /// Number of parallel threads for entity processing (0 = sequential)
-    #[arg(short = 'j', long = "threads", default_value_t = 8)]
+    #[arg(short = 'j', long = "threads", default_value_t = 16)]
     threads: usize,
 
     /// Number of chunks per thread for load balancing
-    #[arg(long = "chunks-per-thread", default_value_t = 4)]
+    #[arg(long = "chunks-per-thread", default_value_t = 1)]
     chunks_per_thread: usize,
 
     /// Verbosity
